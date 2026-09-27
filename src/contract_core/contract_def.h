@@ -298,6 +298,16 @@
 #define CONTRACT_STATE2_TYPE WOLFPACK2
 #include "contracts/GGWP.h"
 
+#undef CONTRACT_INDEX
+#undef CONTRACT_STATE_TYPE
+#undef CONTRACT_STATE2_TYPE
+
+#define QPROFIT_CONTRACT_INDEX 29
+#define CONTRACT_INDEX QPROFIT_CONTRACT_INDEX
+#define CONTRACT_STATE_TYPE QPROFIT
+#define CONTRACT_STATE2_TYPE QPROFIT2
+#include "contracts/QProfit.h"
+
 // new contracts should be added above this line
 
 #ifdef INCLUDE_CONTRACT_TEST_EXAMPLES
@@ -413,6 +423,7 @@ constexpr struct ContractDescription
     {"QUSINO", 208, 10000, sizeof(QUSINO::StateData)}, // proposal in epoch 206, IPO in 207, construction and first use in 208
     {"ESCROW", 210, 10000, sizeof(ESCROW::StateData)}, // proposal in epoch 208, IPO in 209, construction and first use in 210
     {"GGWP", 218, 10000, sizeof(WOLFPACK::StateData)}, // proposal in epoch 216, IPO in 217, construction and first use in 218
+    {"QPROFIT", 230, 10000, sizeof(QPROFIT::StateData)}, // placeholder construction epoch; adjust before deployment
     // new contracts should be added above this line
 #ifdef INCLUDE_CONTRACT_TEST_EXAMPLES
     {"TESTEXA", 138, 10000, sizeof(TESTEXA::StateData)},
@@ -545,6 +556,7 @@ static void initializeContracts()
     REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(QUSINO);
     REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(ESCROW);
     REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(WOLFPACK);
+    REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(QPROFIT);
     // new contracts should be added above this line
 #ifdef INCLUDE_CONTRACT_TEST_EXAMPLES
     REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(TESTEXA);
