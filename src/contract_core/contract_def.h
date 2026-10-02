@@ -423,7 +423,10 @@ constexpr struct ContractDescription
     {"QUSINO", 208, 10000, sizeof(QUSINO::StateData)}, // proposal in epoch 206, IPO in 207, construction and first use in 208
     {"ESCROW", 210, 10000, sizeof(ESCROW::StateData)}, // proposal in epoch 208, IPO in 209, construction and first use in 210
     {"GGWP", 218, 10000, sizeof(WOLFPACK::StateData)}, // proposal in epoch 216, IPO in 217, construction and first use in 218
-    {"QREWARD", 230, 10000, sizeof(QREWARDS::StateData)}, // asset ticker <=7 chars; placeholder construction epoch, adjust before deployment
+    // NOTE: index 29 here is a placeholder. On the live chain, index 29 is taken by
+    // QPAYHUB (qubic/core PR #1015). QREWARDS must be assigned a UNIQUE index after
+    // QPAYHUB at deployment, and its qpayhubAddress set to QPAYHUB's id(29,0,0,0).
+    {"QREWARD", 230, 10000, sizeof(QREWARDS::StateData)}, // asset ticker <=7 chars; construction epoch is a placeholder
     // new contracts should be added above this line
 #ifdef INCLUDE_CONTRACT_TEST_EXAMPLES
     {"TESTEXA", 138, 10000, sizeof(TESTEXA::StateData)},

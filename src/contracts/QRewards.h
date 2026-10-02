@@ -152,10 +152,11 @@ public:
         HashMap<id, uint64, QREWARDS_MAX_FUNDERS> fundingRoute;
         uint32 numPools;
         id platformOwner;
-        // Receives the 15% QPAY share of fees. Set to QPAY's contract address,
-        // id(QPAY_CONTRACT_INDEX, 0, 0, 0): a plain qpi.transfer there is auto-credited
-        // to QPAY's feePool by its POST_INCOMING_TRANSFER, which QPAY then splits
-        // 10% shareholders / 90% QPAY token holders each epoch. No procedure call needed.
+        // Receives the 15% QPAYHUB share of fees. QPAYHUB (qubic/core PR #1015) is
+        // CONTRACT_INDEX 29, so set this to id(29, 0, 0, 0). A plain qpi.transfer there
+        // is auto-credited to QPAYHUB's feePool by its POST_INCOMING_TRANSFER (accepts
+        // qpiTransfer), which QPAYHUB then splits each epoch 10% its shareholders /
+        // 1% burn / 89% QPAY token holders. No procedure call needed.
         id qpayhubAddress;
         uint64 createPoolFee;
         uint64 operatingFee;   // per-pool per-epoch
