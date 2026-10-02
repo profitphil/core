@@ -86,9 +86,29 @@ Per-holder pending = `pos.profit*meta.acc/SCALE - pos.debt`. **Settle before cha
 
 ## 5. Procedures & functions
 
-**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)`.
+**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)`.
 
-**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)`.
+**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)` · `getAllPoolAssets(6)`.
+
+### Multi-currency dividends
+
+Each pool can pay in up to `QREWARDS_MAX_DIV_CURRENCIES = 4` currencies. Slot 0 is **QU** by default (set at `createPool`); the pool admin adds asset currencies (e.g. QDOGE) with `addDividendCurrency(poolId, assetName, issuer)`. Every currency has its own accumulator, and each position carries a **per-currency reward debt** (`Position.debt[k]`). `claimDividends`/`syncProfit` settle **all** of a pool's currencies.
+
+`depositDividend(poolId, currencyIndex, amount)`:
+- **QU currency** (slot where `assetName==0`): QU is taken from the **invocation reward** (`amount` ignored).
+- **Asset currency**: the contract **pulls `amount`** of the asset from the caller (`transferShareOwnershipAndPossession(..., caller, caller, amount, SELF)`), so the caller must first have **granted QREWARDS management** of those shares (via `QX.TransferShareManagementRights` to this contract's index), or already hold them under QREWARDS management.
+
+### How outside / future contracts feed a pool
+
+A contract pays a pool by invoking `depositDividend` as a cross-contract call:
+
+```cpp
+QREWARDS::depositDividend_input in; in.poolId = POOL; in.currencyIndex = 0; in.amount = 0;
+QREWARDS::depositDividend_output out;
+INVOKE_OTHER_CONTRACT_PROCEDURE(QREWARDS, depositDividend, in, out, quAmount); // QU via invocationReward
+```
+
+**Critical constraint:** Qubic only allows a contract to call another contract **with a lower index**. QREWARDS is index 29, so **only contracts deployed later (index > 29) can call `depositDividend`**. That's fine for *future* contracts (deploy QREWARDS before them). Existing lower-index contracts, and plain user/EOA transactions, feed a pool by having a **user or an off-chain keeper** call `depositDividend` directly (users can call any contract). For asset currencies the caller grants management first (above).
 
 `syncProfit(poolId, user)` is the heart: settle pending at old balance → recompute entitlement → adjust `poolMeta.totalDistributed` → write/remove the position. Idempotent (SET, not ADD).
 
@@ -98,10 +118,10 @@ Per-holder pending = `pos.profit*meta.acc/SCALE - pos.debt`. **Settle before cha
 
 | Component | Size |
 |---|---|
-| Position map (2²² × `{id + {profit,debt}}`) | ~193–256 MB (depends on `id` alignment) |
+| Position map (2²² × `{id + {profit, debt[4]}}`) | ~385–404 MB (depends on `id` alignment) |
 | Registry (1024×64 `AssetRule`) | ~4–6 MB |
 | Pool metadata (1024 `PoolMeta`) | ~0.1 MB |
-| **Total** | **~200–260 MB** (cap is 1 GB) |
+| **Total** | **~400–411 MB** (cap is 1 GB) |
 
 "Positions" = `(pool, wallet)` memberships, not people. One wallet in 3 pools = 3 positions. A wallet that drops to zero holdings has its position reclaimed on the next `syncProfit`, freeing the slot.
 
