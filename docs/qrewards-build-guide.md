@@ -1,6 +1,6 @@
-# QPROFIT — Open Multi-Pool Loyalty & Dividend Platform: Build Guide
+# QREWARDS — Open Multi-Pool Loyalty & Dividend Platform: Build Guide
 
-> Reference implementation: `src/contracts/QProfit.h` (multi-pool / open to anyone).
+> Reference implementation: `src/contracts/QRewards.h` (multi-pool / open to anyone).
 > Purpose: let anyone create a **pool** with its own internal **soulbound** reward token.
 > Holders of a pool's registered ecosystem assets earn that pool's token; outside
 > contracts (or anyone) feed QU into a **specific pool** via `depositDividend(poolId)`,
@@ -24,7 +24,7 @@
 
 ---
 
-## 2. State layout (`src/contracts/QProfit.h`)
+## 2. State layout (`src/contracts/QRewards.h`)
 
 ```cpp
 struct AssetRule { uint64 assetName; id issuer; uint64 unit; uint32 weightBps; uint8 kind; uint8 active; };
@@ -34,8 +34,8 @@ struct Position  { uint64 profit; uint64 debt; };     // one combined HashMap va
 struct KeyProto  { uint64 poolId; id wallet; };       // zeroed then hashed -> composite key
 
 struct StateData {
-    HashMap<id, Position, QPROFIT_POSITION_CAPACITY> positions; // key = K12(poolId, wallet)
-    Array<PoolMeta, QPROFIT_MAX_POOLS>  poolMeta;               // hot scalars (small)
+    HashMap<id, Position, QREWARDS_POSITION_CAPACITY> positions; // key = K12(poolId, wallet)
+    Array<PoolMeta, QREWARDS_MAX_POOLS>  poolMeta;               // hot scalars (small)
     Array<AssetRule, MAX_POOLS*MAX_ASSETS_PER_POOL> registry;   // flat: pool p asset i at p*MAX_ASSETS+i
     uint32 numPools;
     id platformOwner;      // deployer; sets createPoolFee only
