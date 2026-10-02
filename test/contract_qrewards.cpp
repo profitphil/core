@@ -157,6 +157,23 @@ public:
         callFunction(QREWARDS_CONTRACT_INDEX, 6, input, output);
         return output.count;
     }
+
+    sint32 setFundingRoute(const id& caller, uint64 poolId, bit clear)
+    {
+        QREWARDS::setFundingRoute_input input{ poolId, clear };
+        QREWARDS::setFundingRoute_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 14, input, output, caller, 0);
+        return output.returnCode;
+    }
+
+    uint64 getFundingRoute(const id& source, bit& isSet)
+    {
+        QREWARDS::getFundingRoute_input input{ source };
+        QREWARDS::getFundingRoute_output output;
+        callFunction(QREWARDS_CONTRACT_INDEX, 7, input, output);
+        isSet = output.isSet;
+        return output.poolId;
+    }
 };
 
 TEST(ContractQRewards, CreatePoolAndEntitlement)
@@ -270,4 +287,31 @@ TEST(ContractQRewards, ReclaimAndAdminGating)
     t.syncProfit(QR_ALICE, pool, QR_ALICE);
     EXPECT_EQ(t.getPosition(pool, QR_ALICE, p0, p1), 0u);
     EXPECT_EQ(t.getState()->poolTotalDistributed(pool), 0u);
+}
+
+TEST(ContractQRewards, FundingRouteTable)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 5000000000ULL);
+    increaseEnergy(QR_BOB, 5000000000ULL);
+
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+
+    bit isSet = 0;
+    t.getFundingRoute(QR_BOB, isSet);
+    EXPECT_EQ(isSet, 0); // no route yet
+
+    // Can't route to a non-existent pool.
+    EXPECT_EQ(t.setFundingRoute(QR_BOB, 99, 0), QREWARDS_POOL_NOT_FOUND);
+
+    // Register a route, then read it back.
+    EXPECT_EQ(t.setFundingRoute(QR_BOB, pool, 0), QREWARDS_SUCCESS);
+    uint64 routed = t.getFundingRoute(QR_BOB, isSet);
+    EXPECT_EQ(isSet, 1);
+    EXPECT_EQ(routed, pool);
+
+    // Clear it.
+    EXPECT_EQ(t.setFundingRoute(QR_BOB, 0, 1), QREWARDS_SUCCESS);
+    t.getFundingRoute(QR_BOB, isSet);
+    EXPECT_EQ(isSet, 0);
 }

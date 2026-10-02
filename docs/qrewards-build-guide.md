@@ -86,9 +86,9 @@ Per-holder pending = `pos.profit*meta.acc/SCALE - pos.debt`. **Settle before cha
 
 ## 5. Procedures & functions
 
-**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)`.
+**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)` · `setFundingRoute(14)`.
 
-**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)` · `getAllPoolAssets(6)`.
+**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)` · `getAllPoolAssets(6)` · `getFundingRoute(7)`.
 
 ### Multi-currency dividends
 
@@ -109,6 +109,10 @@ INVOKE_OTHER_CONTRACT_PROCEDURE(QREWARDS, depositDividend, in, out, quAmount); /
 ```
 
 **Critical constraint:** Qubic only allows a contract to call another contract **with a lower index**. QREWARDS is index 29, so **only contracts deployed later (index > 29) can call `depositDividend`**. That's fine for *future* contracts (deploy QREWARDS before them). Existing lower-index contracts, and plain user/EOA transactions, feed a pool by having a **user or an off-chain keeper** call `depositDividend` directly (users can call any contract). For asset currencies the caller grants management first (above).
+
+### Tagged QU transfers (no procedure call, works for any index)
+
+A raw QU transfer carries no memo, so tagging is done by a **sender→pool route**. A funder calls `setFundingRoute(poolId, clear=false)` **once**; afterwards any plain QU it sends to the contract is auto-credited to that pool's QU currency (slot 0) by `POST_INCOMING_TRANSFER`. This works for wallets/keepers (`standardTransaction`) **and for any contract via `qpi.transfer`** (`qpiTransfer`) — including **lower-index** contracts that can't `INVOKE_OTHER_CONTRACT_PROCEDURE`. Transfers from senders with no route are left unattributed (effectively donated). `POST_INCOMING_TRANSFER` deliberately ignores `procedureTransaction`/`procedureInvocationByOtherContract` so `depositDividend` is never double-counted. One route per sender; use a dedicated sending address/contract per pool, or `depositDividend` for multi-pool funding.
 
 `syncProfit(poolId, user)` is the heart: settle pending at old balance → recompute entitlement → adjust `poolMeta.totalDistributed` → write/remove the position. Idempotent (SET, not ADD).
 

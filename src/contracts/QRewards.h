@@ -20,6 +20,7 @@ constexpr uint64 QREWARDS_POSITION_CAPACITY    = 4194304ULL; // 2^22 (poolId,wal
 constexpr uint32 QREWARDS_MAX_ASSETS_PER_POOL  = 64;
 constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES   = 4;          // QU + up to 3 assets per pool
 constexpr uint32 QREWARDS_MAX_BATCH            = 16;         // assets per registerAssets call
+constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool routing entries for tagged QU transfers
 constexpr uint64 QREWARDS_REGISTRY_SIZE        = (uint64)QREWARDS_MAX_POOLS * QREWARDS_MAX_ASSETS_PER_POOL;
 constexpr uint64 QREWARDS_ACC_SCALE            = 1000000ULL;
 constexpr uint64 QREWARDS_BPS                  = 10000;
@@ -127,6 +128,8 @@ public:
         HashMap<id, Position, QREWARDS_POSITION_CAPACITY> positions; // key = K12(poolId, wallet)
         Array<PoolMeta, QREWARDS_MAX_POOLS> poolMeta;
         Array<AssetRule, QREWARDS_REGISTRY_SIZE> registry;           // pool p asset i at p*MAX_ASSETS+i
+        // sourceId -> poolId: a plain QU transfer from sourceId is credited to that pool's QU currency.
+        HashMap<id, uint64, QREWARDS_MAX_FUNDERS> fundingRoute;
         uint32 numPools;
         id platformOwner;
         uint64 createPoolFee;
@@ -638,6 +641,25 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
+    // Register (or clear) a funding route: a plain QU transfer from the caller is
+    // auto-credited to poolId's QU currency via POST_INCOMING_TRANSFER. Lets even
+    // lower-index contracts fund a pool with a plain qpi.transfer (no procedure call).
+    struct setFundingRoute_input { uint64 poolId; bit clear; };
+    struct setFundingRoute_output { sint32 returnCode; };
+    PUBLIC_PROCEDURE(setFundingRoute)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.clear)
+        {
+            state.mut().fundingRoute.removeByKey(qpi.invocator());
+            output.returnCode = QREWARDS_SUCCESS;
+            return;
+        }
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        state.mut().fundingRoute.set(qpi.invocator(), input.poolId);
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
     struct TransferShareManagementRights_input { Asset asset; sint64 numberOfShares; uint32 newManagingContractIndex; };
     struct TransferShareManagementRights_output { sint64 transferredNumberOfShares; };
     struct TransferShareManagementRights_locals { sint64 result; };
@@ -809,6 +831,20 @@ public:
         output.numPools = state.get().numPools;
     }
 
+    struct getFundingRoute_input { id source; };
+    struct getFundingRoute_output { uint64 poolId; bit isSet; };
+    struct getFundingRoute_locals { uint64 p; };
+    PUBLIC_FUNCTION_WITH_LOCALS(getFundingRoute)
+    {
+        output.poolId = 0;
+        output.isSet = 0;
+        if (state.get().fundingRoute.get(input.source, locals.p))
+        {
+            output.poolId = locals.p;
+            output.isSet = 1;
+        }
+    }
+
     /**************************************/
     /************REGISTRATION**************/
     /**************************************/
@@ -820,6 +856,7 @@ public:
         REGISTER_USER_FUNCTION(getPoolAsset, 4);
         REGISTER_USER_FUNCTION(getPlatform, 5);
         REGISTER_USER_FUNCTION(getAllPoolAssets, 6);
+        REGISTER_USER_FUNCTION(getFundingRoute, 7);
 
         REGISTER_USER_PROCEDURE(createPool, 1);
         REGISTER_USER_PROCEDURE(registerAsset, 2);
@@ -834,6 +871,7 @@ public:
         REGISTER_USER_PROCEDURE(TransferShareManagementRights, 11);
         REGISTER_USER_PROCEDURE(registerAssets, 12);
         REGISTER_USER_PROCEDURE(addDividendCurrency, 13);
+        REGISTER_USER_PROCEDURE(setFundingRoute, 14);
     }
 
     INITIALIZE()
@@ -847,6 +885,49 @@ public:
     END_EPOCH_WITH_LOCALS()
     {
         state.mut().positions.cleanupIfNeeded();
+        state.mut().fundingRoute.cleanupIfNeeded();
+    }
+
+    // Credit plain incoming QU to a routed pool's QU currency (slot 0).
+    // Only standard wallet transfers and contract qpi.transfers are routed;
+    // procedure/other-contract-invocation transfers are handled by depositDividend,
+    // so they are skipped here to avoid double counting.
+    struct POST_INCOMING_TRANSFER_locals
+    {
+        uint64 poolId;
+        PoolMeta meta;
+        DivCurrency cur;
+        uint64 rev;
+        uint64 num;
+        uint64 inc;
+    };
+    POST_INCOMING_TRANSFER_WITH_LOCALS()
+    {
+        if (input.type != TransferType::standardTransaction && input.type != TransferType::qpiTransfer) return;
+        if (input.amount <= 0) return;
+        if (!state.get().fundingRoute.get(input.sourceId, locals.poolId)) return;
+        if (locals.poolId >= state.get().numPools) return;
+        locals.meta = state.get().poolMeta.get(locals.poolId);
+        if (!locals.meta.active || locals.meta.numCurrencies == 0) return;
+
+        locals.cur = locals.meta.currencies.get(0); // slot 0 is always QU
+        locals.rev = (uint64)input.amount;
+        locals.cur.lifetime += locals.rev;
+        locals.rev += locals.cur.pendingRevenue;
+        if (locals.meta.totalDistributed > 0)
+        {
+            locals.num = locals.rev * QREWARDS_ACC_SCALE + locals.cur.accRemainder;
+            locals.inc = div(locals.num, locals.meta.totalDistributed);
+            locals.cur.acc += locals.inc;
+            locals.cur.accRemainder = locals.num - locals.inc * locals.meta.totalDistributed;
+            locals.cur.pendingRevenue = 0;
+        }
+        else
+        {
+            locals.cur.pendingRevenue = locals.rev;
+        }
+        locals.meta.currencies.set(0, locals.cur);
+        state.mut().poolMeta.set(locals.poolId, locals.meta);
     }
 
     PRE_ACQUIRE_SHARES()
