@@ -33,6 +33,10 @@ constexpr uint64 QREWARDS_DEFAULT_OPERATING_FEE = 100000ULL;     // 100k QU/epoc
 constexpr uint64 QREWARDS_FEE_SHAREHOLDER_PCT  = 70;             // fee split: 70% QREWARDS shareholders
 constexpr uint64 QREWARDS_FEE_QPAYHUB_PCT      = 15;             // 15% QPAYHUB dividends address (rest burned)
 constexpr uint32 QREWARDS_MAX_MISSED_EPOCHS    = 2;              // paused this many epochs, then deactivated
+constexpr uint64 QREWARDS_DIVIDEND_FEE_PCT     = 5;              // 5% fee skimmed from every dividend deposit
+constexpr uint64 QREWARDS_DIVFEE_QPAYHUB_PCT   = 80;            // of the 5% fee: 80% QPAYHUB
+constexpr uint64 QREWARDS_DIVFEE_SHAREHOLDER_PCT = 20;          // of the 5% fee: 20% QREWARDS shareholders
+constexpr uint64 QREWARDS_MAX_EXCLUSIONS       = 65536;         // (poolId,address) exclusions, shared
 
 // return codes
 constexpr sint32 QREWARDS_SUCCESS            = 0;
@@ -146,6 +150,10 @@ public:
     struct StateData
     {
         HashMap<id, Position, QREWARDS_POSITION_CAPACITY> positions; // key = K12(poolId, wallet)
+        // Excluded (poolId,address): key = K12(poolId, address) -> 1. Excluded holders
+        // earn nothing (their entitlement is forced to 0), so they neither receive nor dilute.
+        HashMap<id, uint8, QREWARDS_MAX_EXCLUSIONS> excluded;
+        uint64 pendingDivFeeQU; // QU dividend-fee skim, flushed 80/20 at END_EPOCH
         Array<PoolMeta, QREWARDS_MAX_POOLS> poolMeta;
         Array<AssetRule, QREWARDS_REGISTRY_SIZE> registry;           // pool p asset i at p*MAX_ASSETS+i
         // sourceId -> poolId: a plain QU transfer from sourceId is credited to that pool's QU currency.
@@ -180,6 +188,9 @@ protected:
     struct ComputeEntitlement_locals
     {
         PoolMeta meta;
+        KeyProto proto;
+        id exKey;
+        uint8 exFlag;
         uint32 i;
         uint64 base;
         AssetRule rule;
@@ -192,6 +203,16 @@ protected:
     PRIVATE_FUNCTION_WITH_LOCALS(ComputeEntitlement)
     {
         output.profit = 0;
+        // Excluded (poolId,user) earns nothing.
+        setMemory(locals.proto, 0);
+        locals.proto.poolId = input.poolId;
+        locals.proto.wallet = input.user;
+        locals.exKey = qpi.K12(locals.proto);
+        locals.exFlag = 0;
+        if (state.get().excluded.get(locals.exKey, locals.exFlag) && locals.exFlag)
+        {
+            return;
+        }
         locals.meta = state.get().poolMeta.get(input.poolId);
         locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
         for (locals.i = 0; locals.i < locals.meta.numAssets; locals.i++)
@@ -267,6 +288,36 @@ protected:
         if (locals.burnAmt > 0)
         {
             qpi.burn((sint64)locals.burnAmt);
+        }
+    }
+
+    // Split a QU dividend fee: 80% to QPAYHUB, 20% to QREWARDS shareholders.
+    // (If no QPAYHUB address is set, its 80% is burned.) Remainder -> QPAYHUB side.
+    struct DistributeDivFee_input { uint64 amount; };
+    struct DistributeDivFee_output { };
+    struct DistributeDivFee_locals { uint64 shTotal; uint64 perShare; uint64 actualSh; uint64 toQpayhub; };
+    PRIVATE_PROCEDURE_WITH_LOCALS(DistributeDivFee)
+    {
+        if (input.amount == 0) return;
+        locals.shTotal = div(input.amount * QREWARDS_DIVFEE_SHAREHOLDER_PCT, 100ULL);
+        locals.perShare = div(locals.shTotal, (uint64)NUMBER_OF_COMPUTORS);
+        locals.actualSh = locals.perShare * (uint64)NUMBER_OF_COMPUTORS;
+        if (locals.perShare > 0)
+        {
+            qpi.distributeDividends((sint64)locals.perShare);
+        }
+        // Everything not distributed to shareholders (the 80% + rounding) goes to QPAYHUB.
+        locals.toQpayhub = input.amount - locals.actualSh;
+        if (locals.toQpayhub > 0)
+        {
+            if (state.get().qpayhubAddress != NULL_ID)
+            {
+                qpi.transfer(state.get().qpayhubAddress, (sint64)locals.toQpayhub);
+            }
+            else
+            {
+                qpi.burn((sint64)locals.toQpayhub);
+            }
         }
     }
 
@@ -464,6 +515,27 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
+    // Exclude (or re-include) an address in a pool. Excluded addresses earn nothing
+    // (entitlement forced to 0), so they neither receive dividends nor dilute others.
+    // A newly-excluded address with an existing position is zeroed on its next syncProfit.
+    struct setExcludedAddress_input { uint64 poolId; id address; bit excluded; };
+    struct setExcludedAddress_output { sint32 returnCode; };
+    struct setExcludedAddress_locals { PoolMeta meta; KeyProto proto; id key; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(setExcludedAddress)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        setMemory(locals.proto, 0);
+        locals.proto.poolId = input.poolId;
+        locals.proto.wallet = input.address;
+        locals.key = qpi.K12(locals.proto);
+        if (input.excluded) state.mut().excluded.set(locals.key, 1);
+        else state.mut().excluded.removeByKey(locals.key);
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
     struct syncProfit_input { uint64 poolId; id user; };
     struct syncProfit_output { sint32 returnCode; uint64 profit; };
     struct syncProfit_locals
@@ -621,6 +693,8 @@ public:
         PoolMeta meta;
         DivCurrency cur;
         uint64 rev;
+        uint64 fee;
+        bit isQU;
         uint64 num;
         uint64 inc;
         QRewardsLogger log;
@@ -647,6 +721,7 @@ public:
         {
             // QU currency: use the invocation reward.
             locals.rev = (uint64)qpi.invocationReward();
+            locals.isQU = 1;
         }
         else
         {
@@ -660,9 +735,30 @@ public:
                 return;
             }
             locals.rev = input.amount;
+            locals.isQU = 0;
         }
 
         if (locals.rev == 0) { output.returnCode = QREWARDS_SUCCESS; return; }
+
+        // 5% dividend fee. QU: accrue to pendingDivFeeQU (flushed 80/20 at END_EPOCH).
+        // Asset: whole 5% to QPAYHUB (the 20% shareholder leg needs QU, so assets go 100%).
+        locals.fee = div(locals.rev * QREWARDS_DIVIDEND_FEE_PCT, 100ULL);
+        if (locals.fee > 0)
+        {
+            if (locals.isQU)
+            {
+                state.mut().pendingDivFeeQU += locals.fee;
+                locals.rev -= locals.fee;
+            }
+            else if (state.get().qpayhubAddress != NULL_ID
+                     && qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
+                            SELF, SELF, (sint64)locals.fee, state.get().qpayhubAddress) >= 0)
+            {
+                locals.rev -= locals.fee;
+            }
+            // else (asset with no QPAYHUB address, or transfer failed): no fee taken.
+        }
+
         locals.cur.lifetime += locals.rev;
         locals.rev += locals.cur.pendingRevenue;
 
@@ -945,6 +1041,19 @@ public:
         output.numPools = state.get().numPools;
     }
 
+    struct isExcluded_input { uint64 poolId; id address; };
+    struct isExcluded_output { bit excluded; };
+    struct isExcluded_locals { KeyProto proto; id key; uint8 flag; };
+    PUBLIC_FUNCTION_WITH_LOCALS(isExcluded)
+    {
+        setMemory(locals.proto, 0);
+        locals.proto.poolId = input.poolId;
+        locals.proto.wallet = input.address;
+        locals.key = qpi.K12(locals.proto);
+        locals.flag = 0;
+        output.excluded = (state.get().excluded.get(locals.key, locals.flag) && locals.flag) ? 1 : 0;
+    }
+
     struct getFundingRoute_input { id source; };
     struct getFundingRoute_output { uint64 poolId; bit isSet; };
     struct getFundingRoute_locals { uint64 p; };
@@ -1054,6 +1163,7 @@ public:
         REGISTER_USER_FUNCTION(getFundingRoute, 7);
         REGISTER_USER_FUNCTION(getPoolsByAdmin, 8);
         REGISTER_USER_FUNCTION(getPositions, 9);
+        REGISTER_USER_FUNCTION(isExcluded, 10);
 
         REGISTER_USER_PROCEDURE(createPool, 1);
         REGISTER_USER_PROCEDURE(registerAsset, 2);
@@ -1071,6 +1181,7 @@ public:
         REGISTER_USER_PROCEDURE(setFundingRoute, 14);
         REGISTER_USER_PROCEDURE(depositOperating, 15);
         REGISTER_USER_PROCEDURE(setQpayhubAddress, 16);
+        REGISTER_USER_PROCEDURE(setExcludedAddress, 17);
     }
 
     INITIALIZE()
@@ -1079,6 +1190,7 @@ public:
         state.mut().qpayhubAddress = NULL_ID;
         state.mut().createPoolFee = QREWARDS_DEFAULT_CREATE_FEE;
         state.mut().operatingFee = QREWARDS_DEFAULT_OPERATING_FEE;
+        state.mut().pendingDivFeeQU = 0;
         state.mut().numPools = 0;
     }
 
@@ -1090,6 +1202,8 @@ public:
         PoolMeta meta;
         DistributeFee_input dfi;
         DistributeFee_output dfo;
+        DistributeDivFee_input ddfi;
+        DistributeDivFee_output ddfo;
     };
     END_EPOCH_WITH_LOCALS()
     {
@@ -1125,8 +1239,17 @@ public:
             CALL(DistributeFee, locals.dfi, locals.dfo);
         }
 
+        // Flush the accrued 5% QU dividend fee: 80% QPAYHUB / 20% QREWARDS shareholders.
+        if (state.get().pendingDivFeeQU > 0)
+        {
+            locals.ddfi.amount = state.get().pendingDivFeeQU;
+            CALL(DistributeDivFee, locals.ddfi, locals.ddfo);
+            state.mut().pendingDivFeeQU = 0;
+        }
+
         state.mut().positions.cleanupIfNeeded();
         state.mut().fundingRoute.cleanupIfNeeded();
+        state.mut().excluded.cleanupIfNeeded();
     }
 
     // Credit plain incoming QU to a routed pool's QU currency (slot 0).
@@ -1139,6 +1262,7 @@ public:
         PoolMeta meta;
         DivCurrency cur;
         uint64 rev;
+        uint64 fee;
         uint64 num;
         uint64 inc;
     };
@@ -1149,10 +1273,17 @@ public:
         if (!state.get().fundingRoute.get(input.sourceId, locals.poolId)) return;
         if (locals.poolId >= state.get().numPools) return;
         locals.meta = state.get().poolMeta.get(locals.poolId);
-        if (!locals.meta.active || locals.meta.numCurrencies == 0) return;
+        if (!locals.meta.active || locals.meta.paused || locals.meta.numCurrencies == 0) return;
 
         locals.cur = locals.meta.currencies.get(0); // slot 0 is always QU
         locals.rev = (uint64)input.amount;
+        // 5% dividend fee -> pendingDivFeeQU (flushed 80/20 at END_EPOCH); 95% to the pool.
+        locals.fee = div(locals.rev * QREWARDS_DIVIDEND_FEE_PCT, 100ULL);
+        if (locals.fee > 0)
+        {
+            state.mut().pendingDivFeeQU += locals.fee;
+            locals.rev -= locals.fee;
+        }
         locals.cur.lifetime += locals.rev;
         locals.rev += locals.cur.pendingRevenue;
         if (locals.meta.totalDistributed > 0)

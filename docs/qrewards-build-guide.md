@@ -87,7 +87,11 @@ Per-holder pending = `pos.profit*meta.acc/SCALE - pos.debt`. **Settle before cha
 
 ## 5. Procedures & functions
 
-**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)` · `setFundingRoute(14)` · `depositOperating(15)` (top up a pool's operating balance) · `setQpayhubAddress(16)` (protocol owner).
+**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)` · `setFundingRoute(14)` · `depositOperating(15)` (top up a pool's operating balance) · `setQpayhubAddress(16)` (protocol owner) · `setExcludedAddress(17)` (pool admin).
+
+**Dividend fee:** every dividend deposit is skimmed **5%**; **95% reaches holders**. The 5% is split **80% QPAYHUB / 20% QREWARDS shareholders**. For QU it accrues to `pendingDivFeeQU` and is flushed 80/20 at `END_EPOCH` (20% via `distributeDividends`, 80% transferred to the QPAYHUB address, burned if none set). For a **token** dividend the whole 5% goes to the QPAYHUB address (the 20% shareholder leg needs QU); if no QPAYHUB address is set, no fee is taken on tokens.
+
+**Excluded addresses:** a pool admin calls `setExcludedAddress(poolId, address, excluded)` to exclude/re-include an address (stored as `K12(poolId,address)`). An excluded address's entitlement is forced to **0**, so it neither earns rewards nor receives dividends nor dilutes other holders. A newly-excluded holder with an existing balance is zeroed on its next `syncProfit` (permissionless, so anyone can trigger it). `isExcluded(poolId, address)` is the view.
 
 Fees (create + operating) are split **70% QREWARDS shareholders** (`qpi.distributeDividends`) / **15% to the protocol-owner-set QPAY address** / **15% burned** (if no QPAY address is set, that 15% is burned too). `setPlatformParams(createPoolFee, operatingFee)` and `setQpayhubAddress(addr)` are protocol-owner only.
 
@@ -95,7 +99,7 @@ Fees (create + operating) are split **70% QREWARDS shareholders** (`qpi.distribu
 
 **Index:** QPAYHUB occupies **CONTRACT_INDEX 29**, index 30 is another already-deployed contract, so **QREWARDS is wired at index 31**. Indices 29/30 are not part of this fork, so they're held by empty placeholder contracts (`QRewardsReserved29.h`/`QRewardsReserved30.h`) purely to keep the positional contract array consistent — they carry no logic. QPAYHUB also now has an operator role and affiliate registrar (no longer fully admin-free), and its dividend token issuer is still a devnet placeholder to be re-pointed before mainnet. `END_EPOCH` draws the operating fee from every active pool, pausing the underfunded and deactivating after `QREWARDS_MAX_MISSED_EPOCHS`; paused pools reject `syncProfit`/`depositDividend` but still allow `claimDividends`.
 
-**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)` · `getAllPoolAssets(6)` · `getFundingRoute(7)` · `getPoolsByAdmin(8)` (paginated, 256/page) · `getPositions(9)` (one user across ≤64 pools; each row has profit + pending per currency + a `valid` flag).
+**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)` · `getAllPoolAssets(6)` · `getFundingRoute(7)` · `getPoolsByAdmin(8)` (paginated, 256/page) · `getPositions(9)` (one user across ≤64 pools; each row has profit + pending per currency + a `valid` flag) · `isExcluded(10)`.
 
 ### Multi-currency dividends
 

@@ -23,6 +23,7 @@ public:
     uint64 poolTotalDistributed(uint64 p) const { return poolMeta.get(p).totalDistributed; }
     uint32 poolNumAssets(uint64 p) const { return poolMeta.get(p).numAssets; }
     uint8 poolNumCurrencies(uint64 p) const { return poolMeta.get(p).numCurrencies; }
+    uint64 pendingDivFeeQUOf() const { return pendingDivFeeQU; }
 };
 
 class ContractTestingQRewards : public ContractTesting
@@ -219,6 +220,30 @@ public:
         operatingBalance = output.operatingBalance;
         paused = output.paused;
         return output.active;
+    }
+
+    uint64 previewProfit(uint64 poolId, const id& user)
+    {
+        QREWARDS::previewProfit_input input{ poolId, user };
+        QREWARDS::previewProfit_output output;
+        callFunction(QREWARDS_CONTRACT_INDEX, 2, input, output);
+        return output.profit;
+    }
+
+    sint32 setExcluded(const id& caller, uint64 poolId, const id& address, bit excluded)
+    {
+        QREWARDS::setExcludedAddress_input input{ poolId, address, excluded };
+        QREWARDS::setExcludedAddress_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 17, input, output, caller, 0);
+        return output.returnCode;
+    }
+
+    bit isExcluded(uint64 poolId, const id& address)
+    {
+        QREWARDS::isExcluded_input input{ poolId, address };
+        QREWARDS::isExcluded_output output;
+        callFunction(QREWARDS_CONTRACT_INDEX, 10, input, output);
+        return output.excluded;
     }
 };
 
@@ -436,4 +461,58 @@ TEST(ContractQRewards, GetPositionsBatch)
     EXPECT_EQ(cnt, 2u);
     EXPECT_EQ(profitA, 75u);
     EXPECT_EQ(validForNonexistent, 0); // pool 99 flagged invalid
+}
+
+TEST(ContractQRewards, ExcludedAddress)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_ALICE, 5000000000ULL);
+
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+    t.issueAsset(QR_ALICE, QR_TOKEN, 50000000LL);
+    t.registerAsset(QR_ADMIN, pool, QR_TOKEN, QR_ALICE, 1000000ULL, 10000, 0);
+    EXPECT_EQ(t.previewProfit(pool, QR_ALICE), 75u);
+
+    // Exclude Alice -> entitlement 0, synced to zero, removed from totals.
+    EXPECT_EQ(t.setExcluded(QR_ADMIN, pool, QR_ALICE, 1), QREWARDS_SUCCESS);
+    EXPECT_EQ(t.isExcluded(pool, QR_ALICE), 1);
+    EXPECT_EQ(t.previewProfit(pool, QR_ALICE), 0u);
+    t.syncProfit(QR_ALICE, pool, QR_ALICE);
+    uint64 p0 = 0, p1 = 0;
+    EXPECT_EQ(t.getPosition(pool, QR_ALICE, p0, p1), 0u);
+    EXPECT_EQ(t.getState()->poolTotalDistributed(pool), 0u);
+
+    // Re-include -> earns again.
+    EXPECT_EQ(t.setExcluded(QR_ADMIN, pool, QR_ALICE, 0), QREWARDS_SUCCESS);
+    EXPECT_EQ(t.isExcluded(pool, QR_ALICE), 0);
+    EXPECT_EQ(t.previewProfit(pool, QR_ALICE), 75u);
+
+    // Non-admin cannot exclude.
+    EXPECT_EQ(t.setExcluded(QR_ALICE, pool, QR_BOB, 1), QREWARDS_NOT_ADMIN);
+}
+
+TEST(ContractQRewards, DividendFeeFivePercent)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_ALICE, 5000000000ULL);
+    increaseEnergy(QR_BOB, 5000000000ULL);
+
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+    t.issueAsset(QR_ALICE, QR_TOKEN, 50000000LL);
+    t.registerAsset(QR_ADMIN, pool, QR_TOKEN, QR_ALICE, 1000000ULL, 10000, 0);
+    t.syncProfit(QR_ALICE, pool, QR_ALICE);
+    ASSERT_EQ(t.getState()->poolTotalDistributed(pool), 75u);
+
+    // 10,000 QU deposited: 5% (500) fee accrues, 9,500 reaches the sole holder.
+    t.depositQU(QR_BOB, pool, 10000ULL);
+    uint64 p0 = 0, p1 = 0;
+    t.getPosition(pool, QR_ALICE, p0, p1);
+    EXPECT_EQ(p0, 9500u);
+    EXPECT_EQ(t.getState()->pendingDivFeeQUOf(), 500u);
+
+    // END_EPOCH flushes the accrued fee (80/20).
+    t.endEpoch();
+    EXPECT_EQ(t.getState()->pendingDivFeeQUOf(), 0u);
 }
