@@ -18,7 +18,8 @@
 | Dividend currency | **QU**, directed per pool via `depositDividend(poolId)`. |
 | Dividend denominator | **Distributed only**, per pool; remainder carry; `pendingRevenue` buffer. |
 | Token | **Soulbound** internal accounting (combined `{profit,debt}` value), not transferable. |
-| Pool creation | **Open** + small QU fee **burned** (anti-spam, no central beneficiary). Platform owner can retune the fee; takes **no** dividend cut. |
+| Pool creation | **Open**. Fee **5,000,000 QU** (protocol-owner tunable), split **70% QREWARDS shareholders / 15% QPAYHUB address / 15% burn**. Any excess seeds the pool's operating balance. |
+| Operating fee | **100,000 QU/epoch per pool** (protocol-owner tunable), drawn at `END_EPOCH` from a per-pool operating balance the admin tops up (`depositOperating`); same 70/15/15 split. Underfunded → **paused up to `QREWARDS_MAX_MISSED_EPOCHS` (2) epochs, then deactivated**. |
 | Keys | A position key = `K12(poolId, wallet)`; `wallet` is a real Qubic public key. |
 | Split-resistance | Per-pool reward = proportional base × non-decreasing whole-balance concentration multiplier × admin-set price weight. |
 
@@ -86,7 +87,9 @@ Per-holder pending = `pos.profit*meta.acc/SCALE - pos.debt`. **Settle before cha
 
 ## 5. Procedures & functions
 
-**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)` · `setFundingRoute(14)`.
+**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)` · `setFundingRoute(14)` · `depositOperating(15)` (top up a pool's operating balance) · `setQpayhubAddress(16)` (protocol owner).
+
+Fees (create + operating) are split **70% QREWARDS shareholders** (`qpi.distributeDividends`) / **15% to the protocol-owner-set QPAYHUB address** / **15% burned** (if no QPAYHUB address is set, that 15% is burned too). `setPlatformParams(createPoolFee, operatingFee)` and `setQpayhubAddress(addr)` are protocol-owner only. `END_EPOCH` draws the operating fee from every active pool, pausing the underfunded and deactivating after `QREWARDS_MAX_MISSED_EPOCHS`; paused pools reject `syncProfit`/`depositDividend` but still allow `claimDividends`.
 
 **Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)` · `getAllPoolAssets(6)` · `getFundingRoute(7)` · `getPoolsByAdmin(8)` (paginated, 256/page) · `getPositions(9)` (one user across ≤64 pools; each row has profit + pending per currency + a `valid` flag).
 

@@ -28,7 +28,11 @@ constexpr uint64 QREWARDS_ACC_SCALE            = 1000000ULL;
 constexpr uint64 QREWARDS_BPS                  = 10000;
 constexpr uint32 QREWARDS_MAX_WEIGHT_BPS       = 1000000;        // cap weight at 100x
 constexpr uint64 QREWARDS_DEFAULT_SUPPLY       = 1000000000ULL;  // informational per-pool token supply
-constexpr uint64 QREWARDS_DEFAULT_CREATE_FEE   = 1000000ULL;     // anti-spam QU, burned; platform-owner tunable
+constexpr uint64 QREWARDS_DEFAULT_CREATE_FEE   = 5000000ULL;     // 5M QU to create a pool; protocol-owner tunable
+constexpr uint64 QREWARDS_DEFAULT_OPERATING_FEE = 100000ULL;     // 100k QU/epoch per pool; protocol-owner tunable
+constexpr uint64 QREWARDS_FEE_SHAREHOLDER_PCT  = 70;             // fee split: 70% QREWARDS shareholders
+constexpr uint64 QREWARDS_FEE_QPAYHUB_PCT      = 15;             // 15% QPAYHUB dividends address (rest burned)
+constexpr uint32 QREWARDS_MAX_MISSED_EPOCHS    = 2;              // paused this many epochs, then deactivated
 
 // return codes
 constexpr sint32 QREWARDS_SUCCESS            = 0;
@@ -44,6 +48,7 @@ constexpr sint32 QREWARDS_INSUFFICIENT_FEE   = 9;
 constexpr sint32 QREWARDS_NOT_PLATFORM_OWNER = 10;
 constexpr sint32 QREWARDS_CURRENCIES_FULL    = 11;
 constexpr sint32 QREWARDS_TRANSFER_FAILED    = 12;
+constexpr sint32 QREWARDS_POOL_PAUSED        = 13;
 
 // log types
 constexpr uint32 QREWARDS_LOG_SUCCESS       = 0;
@@ -106,9 +111,12 @@ public:
         uint64 supply;            // informational pool-token supply
         uint64 totalDistributed;  // undistributed = supply - totalDistributed
         uint64 label;             // short packed name (optional)
+        uint64 operatingBalance;  // QU reserve for the per-epoch operating fee
         uint32 numAssets;
+        uint32 missedEpochs;      // consecutive epochs the operating fee could not be paid
         uint8  numCurrencies;
-        uint8  active;
+        uint8  active;            // 1 = pool exists (0 after deactivation)
+        uint8  paused;            // 1 = underfunded, not accruing
         Array<DivCurrency, QREWARDS_MAX_DIV_CURRENCIES> currencies;
     };
 
@@ -144,7 +152,9 @@ public:
         HashMap<id, uint64, QREWARDS_MAX_FUNDERS> fundingRoute;
         uint32 numPools;
         id platformOwner;
+        id qpayhubAddress;     // receives the 15% QPAYHUB share of fees
         uint64 createPoolFee;
+        uint64 operatingFee;   // per-pool per-epoch
     };
 
 protected:
@@ -221,6 +231,40 @@ protected:
         }
     }
 
+    // Split a QU fee: 70% to QREWARDS shareholders, 15% to the QPAYHUB address, 15% burned.
+    // (If no QPAYHUB address is set, its share is burned too.) Remainder/rounding -> burn.
+    struct DistributeFee_input { uint64 amount; };
+    struct DistributeFee_output { };
+    struct DistributeFee_locals { uint64 shTotal; uint64 qpayhub; uint64 perShare; uint64 actualSh; uint64 burnAmt; };
+    PRIVATE_PROCEDURE_WITH_LOCALS(DistributeFee)
+    {
+        if (input.amount == 0) return;
+        locals.shTotal = div(input.amount * QREWARDS_FEE_SHAREHOLDER_PCT, 100ULL);
+        locals.qpayhub = div(input.amount * QREWARDS_FEE_QPAYHUB_PCT, 100ULL);
+        locals.perShare = div(locals.shTotal, (uint64)NUMBER_OF_COMPUTORS);
+        locals.actualSh = locals.perShare * (uint64)NUMBER_OF_COMPUTORS;
+        if (locals.perShare > 0)
+        {
+            qpi.distributeDividends((sint64)locals.perShare);
+        }
+        if (locals.qpayhub > 0)
+        {
+            if (state.get().qpayhubAddress != NULL_ID)
+            {
+                qpi.transfer(state.get().qpayhubAddress, (sint64)locals.qpayhub);
+            }
+            else
+            {
+                locals.qpayhub = 0; // no address set -> burn this share instead
+            }
+        }
+        locals.burnAmt = input.amount - locals.actualSh - locals.qpayhub;
+        if (locals.burnAmt > 0)
+        {
+            qpi.burn((sint64)locals.burnAmt);
+        }
+    }
+
 public:
     /**************************************/
     /********PROCEDURES (state-changing)***/
@@ -228,7 +272,7 @@ public:
 
     struct createPool_input { uint64 supply; uint64 label; };
     struct createPool_output { sint32 returnCode; uint64 poolId; };
-    struct createPool_locals { PoolMeta meta; DivCurrency qu; QRewardsLogger log; };
+    struct createPool_locals { PoolMeta meta; DivCurrency qu; DistributeFee_input dfi; DistributeFee_output dfo; QRewardsLogger log; };
     PUBLIC_PROCEDURE_WITH_LOCALS(createPool)
     {
         if ((uint64)qpi.invocationReward() < state.get().createPoolFee)
@@ -243,15 +287,18 @@ public:
             output.returnCode = QREWARDS_MAX_POOLS_REACHED;
             return;
         }
-        if (state.get().createPoolFee > 0) qpi.burn((sint64)state.get().createPoolFee);
-        if ((uint64)qpi.invocationReward() > state.get().createPoolFee)
-            qpi.transfer(qpi.invocator(), qpi.invocationReward() - (sint64)state.get().createPoolFee);
+        // 70/15/15 split of the create fee; any excess seeds the pool's operating balance.
+        locals.dfi.amount = state.get().createPoolFee;
+        CALL(DistributeFee, locals.dfi, locals.dfo);
 
         setMemory(locals.meta, 0);
         locals.meta.admin = qpi.invocator();
         locals.meta.supply = (input.supply == 0) ? QREWARDS_DEFAULT_SUPPLY : input.supply;
         locals.meta.label = input.label;
+        locals.meta.operatingBalance = (uint64)qpi.invocationReward() - state.get().createPoolFee;
         locals.meta.active = 1;
+        locals.meta.paused = 0;
+        locals.meta.missedEpochs = 0;
         // currency slot 0 = QU by default
         setMemory(locals.qu, 0);
         locals.qu.assetName = 0;
@@ -439,6 +486,7 @@ public:
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
         if (!locals.meta.active) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
+        if (locals.meta.paused) { output.returnCode = QREWARDS_POOL_PAUSED; return; }
 
         setMemory(locals.proto, 0);
         locals.proto.poolId = input.poolId;
@@ -581,10 +629,11 @@ public:
             return;
         }
         locals.meta = state.get().poolMeta.get(input.poolId);
-        if (!locals.meta.active || input.currencyIndex >= locals.meta.numCurrencies)
+        if (!locals.meta.active || locals.meta.paused || input.currencyIndex >= locals.meta.numCurrencies)
         {
             if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-            output.returnCode = (!locals.meta.active) ? QREWARDS_POOL_INACTIVE : QREWARDS_INVALID_INDEX;
+            output.returnCode = (!locals.meta.active) ? QREWARDS_POOL_INACTIVE
+                               : (locals.meta.paused ? QREWARDS_POOL_PAUSED : QREWARDS_INVALID_INDEX);
             return;
         }
         locals.cur = locals.meta.currencies.get(input.currencyIndex);
@@ -632,13 +681,53 @@ public:
         LOG_INFO(locals.log);
     }
 
-    struct setPlatformParams_input { uint64 createPoolFee; };
+    // Top up a pool's operating balance (the per-epoch operating fee is drawn from it).
+    // Open to anyone; QU is taken from the invocation reward.
+    struct depositOperating_input { uint64 poolId; };
+    struct depositOperating_output { sint32 returnCode; uint64 operatingBalance; };
+    struct depositOperating_locals { PoolMeta meta; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(depositOperating)
+    {
+        if (input.poolId >= state.get().numPools)
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_POOL_NOT_FOUND;
+            return;
+        }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (!locals.meta.active) // a deactivated pool cannot be revived
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_POOL_INACTIVE;
+            return;
+        }
+        if (qpi.invocationReward() > 0)
+        {
+            locals.meta.operatingBalance += (uint64)qpi.invocationReward();
+            state.mut().poolMeta.set(input.poolId, locals.meta);
+        }
+        output.operatingBalance = locals.meta.operatingBalance;
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    struct setPlatformParams_input { uint64 createPoolFee; uint64 operatingFee; };
     struct setPlatformParams_output { sint32 returnCode; };
     PUBLIC_PROCEDURE(setPlatformParams)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
         state.mut().createPoolFee = input.createPoolFee;
+        state.mut().operatingFee = input.operatingFee;
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    struct setQpayhubAddress_input { id qpayhubAddress; };
+    struct setQpayhubAddress_output { sint32 returnCode; };
+    PUBLIC_PROCEDURE(setQpayhubAddress)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
+        state.mut().qpayhubAddress = input.qpayhubAddress;
         output.returnCode = QREWARDS_SUCCESS;
     }
 
@@ -763,9 +852,12 @@ public:
         uint64 totalDistributed;
         uint64 undistributed;
         uint64 label;
+        uint64 operatingBalance;
         uint32 numAssets;
+        uint32 missedEpochs;
         uint8 numCurrencies;
         uint8 active;
+        uint8 paused;
         Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyAssetName;
         sint32 returnCode;
     };
@@ -781,9 +873,12 @@ public:
         output.undistributed = (locals.meta.supply > locals.meta.totalDistributed)
             ? (locals.meta.supply - locals.meta.totalDistributed) : 0;
         output.label = locals.meta.label;
+        output.operatingBalance = locals.meta.operatingBalance;
         output.numAssets = locals.meta.numAssets;
+        output.missedEpochs = locals.meta.missedEpochs;
         output.numCurrencies = locals.meta.numCurrencies;
         output.active = locals.meta.active;
+        output.paused = locals.meta.paused;
         for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
         {
             locals.cur = locals.meta.currencies.get(locals.k);
@@ -835,11 +930,13 @@ public:
     }
 
     struct getPlatform_input { };
-    struct getPlatform_output { id platformOwner; uint64 createPoolFee; uint32 numPools; };
+    struct getPlatform_output { id platformOwner; id qpayhubAddress; uint64 createPoolFee; uint64 operatingFee; uint32 numPools; };
     PUBLIC_FUNCTION(getPlatform)
     {
         output.platformOwner = state.get().platformOwner;
+        output.qpayhubAddress = state.get().qpayhubAddress;
         output.createPoolFee = state.get().createPoolFee;
+        output.operatingFee = state.get().operatingFee;
         output.numPools = state.get().numPools;
     }
 
@@ -967,18 +1064,62 @@ public:
         REGISTER_USER_PROCEDURE(registerAssets, 12);
         REGISTER_USER_PROCEDURE(addDividendCurrency, 13);
         REGISTER_USER_PROCEDURE(setFundingRoute, 14);
+        REGISTER_USER_PROCEDURE(depositOperating, 15);
+        REGISTER_USER_PROCEDURE(setQpayhubAddress, 16);
     }
 
     INITIALIZE()
     {
         state.mut().platformOwner = NULL_ID;
+        state.mut().qpayhubAddress = NULL_ID;
         state.mut().createPoolFee = QREWARDS_DEFAULT_CREATE_FEE;
+        state.mut().operatingFee = QREWARDS_DEFAULT_OPERATING_FEE;
         state.mut().numPools = 0;
     }
 
-    struct END_EPOCH_locals { };
+    struct END_EPOCH_locals
+    {
+        uint32 i;
+        uint64 fee;
+        uint64 collected;
+        PoolMeta meta;
+        DistributeFee_input dfi;
+        DistributeFee_output dfo;
+    };
     END_EPOCH_WITH_LOCALS()
     {
+        // Draw the per-epoch operating fee from each active pool; underfunded pools
+        // are paused, and deactivated after being paused more than QREWARDS_MAX_MISSED_EPOCHS.
+        locals.fee = state.get().operatingFee;
+        locals.collected = 0;
+        for (locals.i = 0; locals.i < state.get().numPools; locals.i++)
+        {
+            locals.meta = state.get().poolMeta.get(locals.i);
+            if (!locals.meta.active) continue;
+            if (locals.fee == 0 || locals.meta.operatingBalance >= locals.fee)
+            {
+                locals.meta.operatingBalance -= locals.fee;
+                locals.collected += locals.fee;
+                locals.meta.paused = 0;
+                locals.meta.missedEpochs = 0;
+            }
+            else
+            {
+                locals.meta.paused = 1;
+                locals.meta.missedEpochs++;
+                if (locals.meta.missedEpochs > QREWARDS_MAX_MISSED_EPOCHS)
+                {
+                    locals.meta.active = 0; // paused > MAX epochs -> deactivate
+                }
+            }
+            state.mut().poolMeta.set(locals.i, locals.meta);
+        }
+        if (locals.collected > 0)
+        {
+            locals.dfi.amount = locals.collected;
+            CALL(DistributeFee, locals.dfi, locals.dfo);
+        }
+
         state.mut().positions.cleanupIfNeeded();
         state.mut().fundingRoute.cleanupIfNeeded();
     }

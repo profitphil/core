@@ -197,6 +197,29 @@ public:
         validB = output.positions.get(1).valid;
         return output.count;
     }
+
+    sint32 depositOperating(const id& caller, uint64 poolId, uint64 amount)
+    {
+        QREWARDS::depositOperating_input input{ poolId };
+        QREWARDS::depositOperating_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 15, input, output, caller, amount);
+        return output.returnCode;
+    }
+
+    void endEpoch()
+    {
+        callSystemProcedure(QREWARDS_CONTRACT_INDEX, END_EPOCH);
+    }
+
+    uint8 getPoolState(uint64 poolId, uint64& operatingBalance, uint8& paused)
+    {
+        QREWARDS::getPool_input input{ poolId };
+        QREWARDS::getPool_output output;
+        callFunction(QREWARDS_CONTRACT_INDEX, 3, input, output);
+        operatingBalance = output.operatingBalance;
+        paused = output.paused;
+        return output.active;
+    }
 };
 
 TEST(ContractQRewards, CreatePoolAndEntitlement)
@@ -360,6 +383,39 @@ TEST(ContractQRewards, GetPoolsByAdmin)
     EXPECT_EQ(total, 1u);
     EXPECT_EQ(cnt, 1u);
     EXPECT_EQ(first, bobPool);
+}
+
+TEST(ContractQRewards, OperatingFeePauseDeactivate)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+
+    // 5M create fee + 250k seeded into operating balance (the excess).
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE + 250000ULL);
+    uint64 bal = 0; uint8 paused = 9;
+    EXPECT_EQ(t.getPoolState(pool, bal, paused), 1);
+    EXPECT_EQ(bal, 250000u);
+    EXPECT_EQ(paused, 0);
+
+    // Two epochs draw 100k each; still funded.
+    t.endEpoch();
+    t.getPoolState(pool, bal, paused);
+    EXPECT_EQ(bal, 150000u); EXPECT_EQ(paused, 0);
+    t.endEpoch();
+    t.getPoolState(pool, bal, paused);
+    EXPECT_EQ(bal, 50000u); EXPECT_EQ(paused, 0);
+
+    // Now underfunded: paused for 2 epochs (still active)...
+    t.endEpoch();
+    EXPECT_EQ(t.getPoolState(pool, bal, paused), 1); EXPECT_EQ(paused, 1);
+    t.endEpoch();
+    EXPECT_EQ(t.getPoolState(pool, bal, paused), 1); EXPECT_EQ(paused, 1);
+    // ...then deactivated on the next miss.
+    t.endEpoch();
+    EXPECT_EQ(t.getPoolState(pool, bal, paused), 0); // deactivated
+
+    // Topping up a deactivated pool is rejected.
+    EXPECT_EQ(t.depositOperating(QR_ADMIN, pool, 1000000ULL), QREWARDS_POOL_INACTIVE);
 }
 
 TEST(ContractQRewards, GetPositionsBatch)
