@@ -1,241 +1,139 @@
-# QPROFIT — Ecosystem Loyalty & Dividend Contract: Build Guide
+# QPROFIT — Open Multi-Pool Loyalty & Dividend Platform: Build Guide
 
-> Status: design + reference implementation (`src/contracts/QProfit.h`).
-> Purpose: reward supporters of the ecosystem. Holders of qualifying ecosystem
-> assets earn a **soulbound** internal PROFIT balance; ecosystem contracts feed a
-> **% fee** into QPROFIT, which pays **QU dividends** pro‑rata to distributed PROFIT.
-
----
-
-## 1. Design decisions (locked)
-
-| # | Topic | Decision |
-|---|-------|----------|
-| 1 | Dividend currency | **QU** (native). |
-| 2 | Holder cap | **131,072** (`QPROFIT_MAX_HOLDERS`). O(N) only at settle time — see §7. |
-| 3 | Double-counting | `syncProfit` is **idempotent** (SET, not ADD). Sybil handled by the convex whole‑balance multiplier (§5). |
-| 4 | Admin | **Single admin ID** (you). Set in `INITIALIZE`; controls the asset registry. |
-| 5 | Dividend denominator | **Only distributed PROFIT.** Undistributed is *not* counted and earns nothing. Revenue arriving while `totalDistributed == 0` is buffered in `pendingRevenue`. |
+> Reference implementation: `src/contracts/QProfit.h` (multi-pool / open to anyone).
+> Purpose: let anyone create a **pool** with its own internal **soulbound** reward token.
+> Holders of a pool's registered ecosystem assets earn that pool's token; outside
+> contracts (or anyone) feed QU into a **specific pool** via `depositDividend(poolId)`,
+> paid pro-rata to that pool's distributed balances. Pools are fully isolated.
 
 ---
 
-## 2. Core model
+## 1. Decisions baked in
 
-- **PROFIT is not a tradeable QPI asset.** It is internal accounting (`HashMap<id,uint64>`),
-  i.e. **soulbound**. This is what makes *reclaim* possible and keeps PROFIT equal to
-  the holder's *current* qualifying support. (Issuing a transferable asset would let
-  users move it and break clawback.)
-- **PROFIT balance = a pure function of current holdings.** `syncProfit(user)` recomputes
-  it from live balances; distribute/reclaim is just the delta.
-- **Dividends** accrue to distributed PROFIT via a MasterChef‑style accumulator so there is
-  **no O(N) payout loop** and no integer‑rounding loss.
-- **1,000,000,000 logical supply** is a ceiling on total distributable PROFIT; with the
-  reward sizes below it is effectively non‑binding.
-
----
-
-## 3. Reading holdings
-
-To read how much of an asset a user holds **regardless of which contract manages it**:
-
-```cpp
-Asset a; a.assetName = rule.assetName; a.issuer = rule.issuer;
-sint64 held = qpi.numberOfShares(a,
-                 AssetOwnershipSelect::byOwner(user),
-                 AssetPossessionSelect::byPossessor(user));
-```
-
-`byOwner`/`byPossessor` set `anyManagingContract = true`, so this is the user's true
-wallet balance of that token or contract‑share. Validate every asset with
-`qpi.isAssetIssued(issuer, assetName)` before registering it.
+| Topic | Decision |
+|---|---|
+| Multi-tenant | Anyone can `createPool`; each pool has its own admin, token, registry, dividends. |
+| Scale | `MAX_POOLS = 1024`, position capacity `2²² = 4,194,304` (poolId,wallet) pairs. |
+| State size | ~200–260 MB (well under the 1 GB cap). |
+| Dividend currency | **QU**, directed per pool via `depositDividend(poolId)`. |
+| Dividend denominator | **Distributed only**, per pool; remainder carry; `pendingRevenue` buffer. |
+| Token | **Soulbound** internal accounting (combined `{profit,debt}` value), not transferable. |
+| Pool creation | **Open** + small QU fee **burned** (anti-spam, no central beneficiary). Platform owner can retune the fee; takes **no** dividend cut. |
+| Keys | A position key = `K12(poolId, wallet)`; `wallet` is a real Qubic public key. |
+| Split-resistance | Per-pool reward = proportional base × non-decreasing whole-balance concentration multiplier × admin-set price weight. |
 
 ---
 
-## 4. Why the reward is proportional (not a small badge)
-
-Split‑proofness requires **reward‑per‑unit to be non‑decreasing in holdings**. If you also
-want **realistic thresholds spanning a wide range** (entry → whale is easily 100×), the
-reward must span ≥100× too — i.e. it must be **roughly proportional to holdings**, with a
-convex top. Small fixed 1–5 tiers *cannot* be split‑proof over a realistic range. Hence the
-model below: a proportional base × a whole‑balance concentration multiplier × a price weight.
-
----
-
-## 5. Reward formula (per asset, then summed)
-
-```
-basePoints = held / unit_asset                     // integer floor; held < unit  => 0 points
-mult       = concentrationMultiplier(basePoints)   // bps, applies to the WHOLE balance
-PROFIT_a   = basePoints * mult * weightBps_asset / (10000 * 10000)
-PROFIT     = sum over registered assets of PROFIT_a
-```
-
-**(a) `unit` — accessibility.** Quantity equal to one base point. No unreachable tier — a
-whale simply earns proportionally more. Suggested starting units:
-
-| Asset | supply | `unit` (1 base point) |
-|-------|--------|------------------------|
-| QXMR | 111 b | 1,000,000 |
-| QDoge | 21 b | 200,000 |
-| Qpay | 736 m | 7,000 |
-| Qtreat token | 5,000 | 5 |
-| Contract shares (QRaffle / Qtreat / QPAYHUB) | 676 | 1 |
-
-**(b) Concentration multiplier — makes deep holders disproportionately valuable AND kills
-splitting.** Applied to the *entire* base‑point balance:
-
-| basePoints | multiplier (bps) |
-|-----------:|------------------|
-| ≥ 1   | 10000 (1.00×) |
-| ≥ 10  | 12500 (1.25×) |
-| ≥ 50  | 15000 (1.50×) |
-| ≥ 200 | 20000 (2.00×) |
-
-Because the multiplier hits the whole balance, splitting `H` across `k` wallets yields
-`(H/unit)·m(H/k) ≤ (H/unit)·m(H)` = concentrated (m non‑decreasing). Concentrating into a
-higher band **strictly wins**; equal‑band splits merely tie. Above the top band the reward
-is linear (constant top density) — no cap to exploit. **The only split‑proofness invariant to
-enforce is: the multiplier is non‑decreasing.**
-
-**(c) `weightBps` — price awareness.** Per‑asset value multiplier, `10000 = 1.0×`, admin‑set to
-reflect *relative price*. A share worth 3× another gets 3× weight, so a cheaper share earns
-proportionally less at equal count. Maintain via `updateWeight` as prices move. (No reliable
-in‑contract spot oracle exists on Qubic; admin‑set weights are the pragmatic v1. An AMM
-time‑averaged price could automate it later, at the cost of manipulation risk.)
-
-**Worked example.** Alice: 5 QRaffle shares (weight 3.0×) + 50 m QXMR (unit 1 m → 50 points):
-- QRaffle: 5 × 1.00 × 3.0 = **15**
-- QXMR: 50 × 1.50 (≥50 band) × 1.0 = **75** → **Total 90**.
-Splitting the 50 m into 5×10 m → 5 × (10 × 1.25) = 62.5 < 75. Concentration wins.
-
----
-
-## 6. Dividend accounting (accumulator, distributed‑only denominator)
-
-State: `accRewardPerTokenScaled` (uint64), `accRemainder` (uint64), `pendingRevenue`
-(uint64), plus `rewardDebt : HashMap<id,uint64>`. Scale `QPROFIT_ACC_SCALE = 1e6`.
-
-```
-depositDividend(rev = invocationReward):
-    rev += pendingRevenue; pendingRevenue = 0
-    if totalDistributed > 0:
-        num  = rev * QPROFIT_ACC_SCALE + accRemainder      // remainder carry => no dust lost
-        accRewardPerTokenScaled += num / totalDistributed
-        accRemainder             = num % totalDistributed
-    else:
-        pendingRevenue += rev                              // nobody to pay yet
-```
-
-Per‑holder pending: `bal * acc / SCALE - rewardDebt[user]`.
-
-**Golden rule:** always **settle pending BEFORE changing a holder's PROFIT balance**, then set
-`rewardDebt[user] = newBal * acc / SCALE`. Getting this order wrong is the classic
-reward‑drain bug.
-
-Overflow notes: keep `SCALE = 1e6` (so `rev * SCALE` fits uint64 for rev up to ~9.2e12 QU per
-deposit). `bal * acc` grows over the contract's lifetime; for an extremely long‑lived,
-high‑revenue deployment consider a periodic checkpoint/reset (documented limitation).
-
----
-
-## 7. Procedures & functions
-
-**Procedures**
-- `registerAsset(assetName, issuer, unit, weightBps, kind)` — admin. Validates issuance,
-  `unit > 0`, registry space; appends an active rule.
-- `updateAsset(index, unit, weightBps, kind, active)` — admin. Edit/deactivate a rule.
-- `updateWeight(index, weightBps)` — admin. Cheap price re‑tune.
-- `syncProfit(user)` — **permissionless** (anyone may poke anyone). Settles pending → recomputes
-  entitlement → adjusts `totalDistributed` → writes balance + `rewardDebt`. Idempotent.
-- `claimDividends()` — settle pending to caller without recomputing PROFIT.
-- `depositDividend()` — called by ecosystem contracts (QU attached) → accumulator (§6).
-- `setAdmin(newAdmin)` — admin only (claim‑if‑NULL bootstrap supported).
-- `TransferShareManagementRights(...)` — standard; lets QPROFIT hand back management of any
-  asset it ever ends up managing.
-
-**Functions (views)**
-- `getProfit(user)` → distributed PROFIT + pending QU.
-- `previewProfit(user)` → entitlement if synced now.
-- `getTotals()` → totalDistributed, undistributed, acc, pendingRevenue.
-- `getAsset(index)` / `getRegistrySize()` / `getAdmin()`.
-
-Settle order inside `syncProfit`:
-1. `old = distributedProfit[user]` (0 if none); `pending = old*acc/SCALE - rewardDebt[user]`;
-   if `pending > 0` `qpi.transfer(user, pending)`.
-2. `neu = computeEntitlement(user)`.
-3. `totalDistributed += neu - old` (branch on sign to avoid uint underflow).
-4. If `neu > 0`: set balance & `rewardDebt = neu*acc/SCALE`; else remove both keys.
-
----
-
-## 8. State layout
+## 2. State layout (`src/contracts/QProfit.h`)
 
 ```cpp
 struct AssetRule { uint64 assetName; id issuer; uint64 unit; uint32 weightBps; uint8 kind; uint8 active; };
+struct PoolMeta  { id admin; uint64 supply, totalDistributed, accRewardPerTokenScaled,
+                   accRemainder, pendingRevenue, lifetimeRevenue, label; uint32 numAssets; uint8 active; };
+struct Position  { uint64 profit; uint64 debt; };     // one combined HashMap value (saves the 32B key duplication)
+struct KeyProto  { uint64 poolId; id wallet; };       // zeroed then hashed -> composite key
 
 struct StateData {
-    HashMap<id, uint64, QPROFIT_MAX_HOLDERS> distributedProfit;
-    HashMap<id, uint64, QPROFIT_MAX_HOLDERS> rewardDebt;
-    Array<AssetRule, QPROFIT_MAX_ASSETS>     registry;
-    uint32 numAssets;
-    uint64 totalDistributed;                 // undistributed = SUPPLY - totalDistributed
-    uint64 accRewardPerTokenScaled;
-    uint64 accRemainder;
-    uint64 pendingRevenue;
-    uint64 lifetimeRevenue;                  // stat
-    id     admin;
+    HashMap<id, Position, QPROFIT_POSITION_CAPACITY> positions; // key = K12(poolId, wallet)
+    Array<PoolMeta, QPROFIT_MAX_POOLS>  poolMeta;               // hot scalars (small)
+    Array<AssetRule, MAX_POOLS*MAX_ASSETS_PER_POOL> registry;   // flat: pool p asset i at p*MAX_ASSETS+i
+    uint32 numPools;
+    id platformOwner;      // deployer; sets createPoolFee only
+    uint64 createPoolFee;  // QU, burned on createPool
 };
 ```
 
----
-
-## 9. Gotchas & security (put in front of any reviewer)
-
-1. **Settle‑before‑balance‑change** ordering — non‑negotiable (§6).
-2. **Multiplier must be non‑decreasing** — the whole split‑proofness guarantee; enforce it if
-   bands ever become admin‑tunable.
-3. **No O(N) loops on hot paths** — the accumulator avoids per‑epoch payout; the only per‑call
-   loop is over the ≤64 registry entries in `computeEntitlement`.
-4. **Admin key is powerful** — it defines which assets/weights mint PROFIT. Consider a timelock
-   or governance later. Guard against `admin == NULL_ID` misconfig.
-5. **Asset validity** — `isAssetIssued` on register; a wrong issuer/name silently reads 0.
-6. **Sybil across genuinely different people** is not "double‑counting" — intended.
-7. **`bal * acc` long‑run overflow** — documented; checkpoint if needed.
-8. **Reentrancy / partial transfer** — `qpi.transfer` returns a status; treat failure sanely
-   (don't zero a balance you failed to pay).
+Layout choices that matter:
+- **Combined `{profit,debt}` value** — avoids storing the 32-byte key twice (one map, not two).
+- **`poolMeta` split from `registry`** — sync/claim read-modify-write only the ~small PoolMeta, never a multi-KB struct.
+- **Composite key must be hashed from a zeroed proto** (`setMemory(proto,0)` before setting fields) so padding bytes can't make `K12` nondeterministic. The hashed key is storage-only; payouts use the wallet id we already hold, so the key never needs reversing.
 
 ---
 
-## 10. Testing checklist
+## 3. Reward model (per pool, per asset)
 
-- Entitlement at `unit` boundaries and at each multiplier band (just below / at / above).
-- Idempotent `syncProfit` (×3 → same balance, no extra dividends).
-- Reclaim path: qualify → drop holdings → `syncProfit` → balance & `totalDistributed` fall.
-- Dividend accrual across multiple `depositDividend`s **with** balance changes between them.
-- `pendingRevenue` buffer: deposit while `totalDistributed == 0`, then a qualifier appears.
-- Remainder carry: many small deposits accumulate with no dust loss.
-- Split demonstration: concentrated ≥ any split (document the numbers).
-- Registry add / update / deactivate + admin gating (non‑admin rejected).
+```
+basePoints = held / unit                       // floor; held < unit => 0
+mult       = concentrationMultiplier(basePoints)  // bps, applied to the WHOLE balance
+PROFIT_a   = basePoints * mult * weightBps / (10000*10000)
+poolProfit = sum over the pool's registered assets
+```
 
----
-
-## 11. Wiring into core (deployment)
-
-`QProfit.h` is registered in `src/contract_core/contract_def.h`:
-- an include block with `QPROFIT_CONTRACT_INDEX`,
-- a `contractDescriptions` row `{"QPROFIT", <constructionEpoch>, 10000, sizeof(QPROFIT::StateData)}`,
-- a `REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(QPROFIT)` line.
-
-Set the real **admin public key** in `INITIALIZE` (placeholder is marked in the file), register
-your assets post‑construction with `registerAsset`, and point each ecosystem contract's fee
-share at `depositDividend`.
+- **`unit`** sets accessibility (one base point). No unreachable tier.
+- **Concentration multiplier** (whole-balance, non-decreasing → split-proof): `≥1 →1.00×, ≥10 →1.25×, ≥50 →1.50×, ≥200 →2.00×`.
+- **`weightBps`** = admin-set relative price (a cheaper asset earns proportionally less).
+- Splitting a wallet's holdings never gains, because the multiplier applies to the whole balance (`m` non-decreasing ⇒ concentrated ≥ any split). Note: different *wallets* are different positions on-chain — no on-chain defence against one person using many wallets (needs off-chain identity).
 
 ---
 
-## 12. Legal note (unchanged from the design discussion)
+## 4. Dividend accounting (per pool, distributed-only)
 
-A token **earned by holding ecosystem assets** that then **pays QU dividends from ecosystem
-fees** is a strong **securities** profile (Howey: money in → common enterprise → profit from
-others' efforts); soulbound helps optics, not the dividend substance. A fee‑collecting
-redistributor can also raise investment‑company questions. Get securities counsel before this
-is live. (Analysis, not legal advice.)
+MasterChef accumulator, `SCALE = 1e6`, denominator = that pool's `totalDistributed`:
+
+```
+depositDividend(poolId): rev = invocationReward + meta.pendingRevenue
+  if meta.totalDistributed > 0:
+      num = rev*SCALE + meta.accRemainder
+      inc = num / meta.totalDistributed; meta.acc += inc; meta.accRemainder = num - inc*meta.totalDistributed
+      meta.pendingRevenue = 0
+  else: meta.pendingRevenue = rev          // nobody to pay yet; QU stays in the contract
+```
+Per-holder pending = `pos.profit*meta.acc/SCALE - pos.debt`. **Settle before changing a balance**, then `pos.debt = pos.profit*meta.acc/SCALE`.
+
+**Isolation guarantee:** a pool's total claimable = `totalDistributed × acc`, and `acc` only rises from deposits *to that pool*. So even though all QU shares one contract balance, a pool can only ever pay out what was deposited to it — no cross-pool drain.
+
+---
+
+## 5. Procedures & functions
+
+**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)`.
+
+**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)`.
+
+`syncProfit(poolId, user)` is the heart: settle pending at old balance → recompute entitlement → adjust `poolMeta.totalDistributed` → write/remove the position. Idempotent (SET, not ADD).
+
+---
+
+## 6. Capacity / state size
+
+| Component | Size |
+|---|---|
+| Position map (2²² × `{id + {profit,debt}}`) | ~193–256 MB (depends on `id` alignment) |
+| Registry (1024×64 `AssetRule`) | ~4–6 MB |
+| Pool metadata (1024 `PoolMeta`) | ~0.1 MB |
+| **Total** | **~200–260 MB** (cap is 1 GB) |
+
+"Positions" = `(pool, wallet)` memberships, not people. One wallet in 3 pools = 3 positions. A wallet that drops to zero holdings has its position reclaimed on the next `syncProfit`, freeing the slot.
+
+---
+
+## 7. Gotchas & security
+
+1. **Settle-before-balance-change** ordering (§4) — non-negotiable.
+2. **Zero the KeyProto before K12** — else padding makes keys nondeterministic (fixed in the file).
+3. **Multiplier must stay non-decreasing** — the split-proofness invariant.
+4. **No O(N) hot paths** — accumulator avoids per-pool payout loops; the only loop is ≤64 registry entries in `computeEntitlement`.
+5. **Pool admins are third parties** — each is isolated to its own pool; a pool admin can't touch other pools or the platform.
+6. **Platform owner is minimal** — sets the creation fee only; no dividend cut; claim-if-NULL at deploy.
+7. **`unit` must be sane** — keep `supply/unit` within safe range so `basePoints × mult × weightBps` can't overflow.
+8. **`profit*acc` long-run overflow** — documented; checkpoint if a pool runs enormous lifetime revenue.
+9. **Asset must be issued** before `registerAsset` (`isAssetIssued`).
+
+---
+
+## 8. Deployment
+
+1. Register in `contract_core/contract_def.h` (done: index 29, construction epoch 230 = placeholder — set the real one).
+2. After construction, the deployer calls `setPlatformOwner` once to claim platform ownership, and `setPlatformParams` to set the creation fee.
+3. Anyone then calls `createPool`, `registerAsset`s their ecosystem assets (units/weights per §3), and points their contracts' fee share at `depositDividend(poolId)`.
+
+---
+
+## 9. Legal note
+
+Opening this to third parties makes it a **platform that facilitates others issuing
+dividend-bearing tokens** — i.e., helping third parties run what are very likely
+**unregistered securities**, plus running a fee-collecting redistributor. That is a
+materially larger regulatory surface than personal use (issuer/exchange/transfer-agent,
+money-transmission, platform-operator liability). Get securities counsel before opening
+it publicly. (Analysis, not legal advice.)
