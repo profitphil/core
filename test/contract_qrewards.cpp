@@ -184,6 +184,19 @@ public:
         total = output.totalMatched;
         return output.count;
     }
+
+    uint32 getPositions2(const id& user, uint64 pA, uint64 pB, uint64& profitA, uint8& validB)
+    {
+        QREWARDS::getPositions_input input;
+        memset(&input, 0, sizeof(input));
+        input.user = user; input.count = 2;
+        input.poolIds.set(0, pA); input.poolIds.set(1, pB);
+        QREWARDS::getPositions_output output;
+        callFunction(QREWARDS_CONTRACT_INDEX, 9, input, output);
+        profitA = output.positions.get(0).profit;
+        validB = output.positions.get(1).valid;
+        return output.count;
+    }
 };
 
 TEST(ContractQRewards, CreatePoolAndEntitlement)
@@ -347,4 +360,24 @@ TEST(ContractQRewards, GetPoolsByAdmin)
     EXPECT_EQ(total, 1u);
     EXPECT_EQ(cnt, 1u);
     EXPECT_EQ(first, bobPool);
+}
+
+TEST(ContractQRewards, GetPositionsBatch)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_ALICE, 5000000000ULL);
+
+    uint64 a = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE); // 0
+    t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);            // 1
+    t.issueAsset(QR_ALICE, QR_TOKEN, 50000000LL);
+    t.registerAsset(QR_ADMIN, a, QR_TOKEN, QR_ALICE, 1000000ULL, 10000, 0);
+    t.syncProfit(QR_ALICE, a, QR_ALICE); // Alice earns 75 in pool a only
+
+    uint64 profitA = 0; uint8 validForNonexistent = 9;
+    // Query pool a (has profit) and pool 99 (does not exist).
+    uint32 cnt = t.getPositions2(QR_ALICE, a, 99, profitA, validForNonexistent);
+    EXPECT_EQ(cnt, 2u);
+    EXPECT_EQ(profitA, 75u);
+    EXPECT_EQ(validForNonexistent, 0); // pool 99 flagged invalid
 }

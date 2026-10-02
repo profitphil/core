@@ -22,6 +22,7 @@ constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES   = 4;          // QU + up to 3 ass
 constexpr uint32 QREWARDS_MAX_BATCH            = 16;         // assets per registerAssets call
 constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool routing entries for tagged QU transfers
 constexpr uint32 QREWARDS_PAGE                 = 256;        // page size for paginated views
+constexpr uint32 QREWARDS_MAX_QUERY            = 64;         // pools per getPositions batch
 constexpr uint64 QREWARDS_REGISTRY_SIZE        = (uint64)QREWARDS_MAX_POOLS * QREWARDS_MAX_ASSETS_PER_POOL;
 constexpr uint64 QREWARDS_ACC_SCALE            = 1000000ULL;
 constexpr uint64 QREWARDS_BPS                  = 10000;
@@ -122,6 +123,16 @@ public:
     {
         uint64 poolId;
         id     wallet;
+    };
+
+    // One row of a batch getPositions response.
+    struct PositionEntry
+    {
+        uint64 poolId;
+        uint64 profit;
+        Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> pending;
+        uint8  numCurrencies;
+        uint8  valid; // 1 if the pool exists
     };
 
     struct StateData
@@ -876,6 +887,57 @@ public:
         output.totalMatched = locals.matched;
     }
 
+    // One user's positions across up to QREWARDS_MAX_QUERY pools in a single call.
+    struct getPositions_input { id user; uint32 count; Array<uint64, QREWARDS_MAX_QUERY> poolIds; };
+    struct getPositions_output { Array<PositionEntry, QREWARDS_MAX_QUERY> positions; uint32 count; };
+    struct getPositions_locals
+    {
+        uint32 i;
+        uint32 k;
+        uint32 n;
+        uint64 poolId;
+        PoolMeta meta;
+        KeyProto proto;
+        id key;
+        Position pos;
+        DivCurrency cur;
+        uint64 pt;
+        PositionEntry entry;
+    };
+    PUBLIC_FUNCTION_WITH_LOCALS(getPositions)
+    {
+        setMemory(output, 0);
+        locals.n = (input.count > QREWARDS_MAX_QUERY) ? QREWARDS_MAX_QUERY : input.count;
+        for (locals.i = 0; locals.i < locals.n; locals.i++)
+        {
+            setMemory(locals.entry, 0);
+            locals.poolId = input.poolIds.get(locals.i);
+            locals.entry.poolId = locals.poolId;
+            if (locals.poolId < state.get().numPools)
+            {
+                locals.meta = state.get().poolMeta.get(locals.poolId);
+                setMemory(locals.proto, 0);
+                locals.proto.poolId = locals.poolId;
+                locals.proto.wallet = input.user;
+                locals.key = qpi.K12(locals.proto);
+                setMemory(locals.pos, 0);
+                state.get().positions.get(locals.key, locals.pos);
+                locals.entry.profit = locals.pos.profit;
+                locals.entry.numCurrencies = locals.meta.numCurrencies;
+                locals.entry.valid = 1;
+                for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+                {
+                    locals.cur = locals.meta.currencies.get(locals.k);
+                    locals.pt = div(locals.pos.profit * locals.cur.acc, QREWARDS_ACC_SCALE);
+                    locals.entry.pending.set(locals.k,
+                        (locals.pt > locals.pos.debt.get(locals.k)) ? (locals.pt - locals.pos.debt.get(locals.k)) : 0);
+                }
+            }
+            output.positions.set(locals.i, locals.entry);
+        }
+        output.count = locals.n;
+    }
+
     /**************************************/
     /************REGISTRATION**************/
     /**************************************/
@@ -889,6 +951,7 @@ public:
         REGISTER_USER_FUNCTION(getAllPoolAssets, 6);
         REGISTER_USER_FUNCTION(getFundingRoute, 7);
         REGISTER_USER_FUNCTION(getPoolsByAdmin, 8);
+        REGISTER_USER_FUNCTION(getPositions, 9);
 
         REGISTER_USER_PROCEDURE(createPool, 1);
         REGISTER_USER_PROCEDURE(registerAsset, 2);
