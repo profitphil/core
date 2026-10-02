@@ -88,7 +88,7 @@ Per-holder pending = `pos.profit*meta.acc/SCALE - pos.debt`. **Settle before cha
 
 **Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)` · `setFundingRoute(14)`.
 
-**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)` · `getAllPoolAssets(6)` · `getFundingRoute(7)`.
+**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)` · `getAllPoolAssets(6)` · `getFundingRoute(7)` · `getPoolsByAdmin(8)` (paginated, 256/page).
 
 ### Multi-currency dividends
 

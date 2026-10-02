@@ -174,6 +174,16 @@ public:
         isSet = output.isSet;
         return output.poolId;
     }
+
+    uint32 getPoolsByAdmin(const id& admin, uint32 offset, uint64& first, uint32& total)
+    {
+        QREWARDS::getPoolsByAdmin_input input{ admin, offset };
+        QREWARDS::getPoolsByAdmin_output output;
+        callFunction(QREWARDS_CONTRACT_INDEX, 8, input, output);
+        first = output.poolIds.get(0);
+        total = output.totalMatched;
+        return output.count;
+    }
 };
 
 TEST(ContractQRewards, CreatePoolAndEntitlement)
@@ -314,4 +324,27 @@ TEST(ContractQRewards, FundingRouteTable)
     EXPECT_EQ(t.setFundingRoute(QR_BOB, 0, 1), QREWARDS_SUCCESS);
     t.getFundingRoute(QR_BOB, isSet);
     EXPECT_EQ(isSet, 0);
+}
+
+TEST(ContractQRewards, GetPoolsByAdmin)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_BOB, 10000000000ULL);
+
+    t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE); // 0
+    t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE); // 1
+    t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE); // 2
+    uint64 bobPool = t.createPool(QR_BOB, 0, QREWARDS_DEFAULT_CREATE_FEE); // 3
+
+    uint64 first = 0; uint32 total = 0;
+    uint32 cnt = t.getPoolsByAdmin(QR_ADMIN, 0, first, total);
+    EXPECT_EQ(total, 3u);
+    EXPECT_EQ(cnt, 3u);
+    EXPECT_EQ(first, 0u);
+
+    cnt = t.getPoolsByAdmin(QR_BOB, 0, first, total);
+    EXPECT_EQ(total, 1u);
+    EXPECT_EQ(cnt, 1u);
+    EXPECT_EQ(first, bobPool);
 }

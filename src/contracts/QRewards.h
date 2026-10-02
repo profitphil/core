@@ -21,6 +21,7 @@ constexpr uint32 QREWARDS_MAX_ASSETS_PER_POOL  = 64;
 constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES   = 4;          // QU + up to 3 assets per pool
 constexpr uint32 QREWARDS_MAX_BATCH            = 16;         // assets per registerAssets call
 constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool routing entries for tagged QU transfers
+constexpr uint32 QREWARDS_PAGE                 = 256;        // page size for paginated views
 constexpr uint64 QREWARDS_REGISTRY_SIZE        = (uint64)QREWARDS_MAX_POOLS * QREWARDS_MAX_ASSETS_PER_POOL;
 constexpr uint64 QREWARDS_ACC_SCALE            = 1000000ULL;
 constexpr uint64 QREWARDS_BPS                  = 10000;
@@ -845,6 +846,36 @@ public:
         }
     }
 
+    // Paginated list of pools owned by an admin. `offset` skips that many matches;
+    // `count` is how many ids this page returned; `totalMatched` is the full total.
+    struct getPoolsByAdmin_input { id admin; uint32 offset; };
+    struct getPoolsByAdmin_output
+    {
+        Array<uint64, QREWARDS_PAGE> poolIds;
+        uint32 count;
+        uint32 totalMatched;
+    };
+    struct getPoolsByAdmin_locals { uint32 i; uint32 matched; PoolMeta meta; };
+    PUBLIC_FUNCTION_WITH_LOCALS(getPoolsByAdmin)
+    {
+        setMemory(output, 0);
+        locals.matched = 0;
+        for (locals.i = 0; locals.i < state.get().numPools; locals.i++)
+        {
+            locals.meta = state.get().poolMeta.get(locals.i);
+            if (locals.meta.admin == input.admin)
+            {
+                if (locals.matched >= input.offset && output.count < QREWARDS_PAGE)
+                {
+                    output.poolIds.set(output.count, locals.i);
+                    output.count++;
+                }
+                locals.matched++;
+            }
+        }
+        output.totalMatched = locals.matched;
+    }
+
     /**************************************/
     /************REGISTRATION**************/
     /**************************************/
@@ -857,6 +888,7 @@ public:
         REGISTER_USER_FUNCTION(getPlatform, 5);
         REGISTER_USER_FUNCTION(getAllPoolAssets, 6);
         REGISTER_USER_FUNCTION(getFundingRoute, 7);
+        REGISTER_USER_FUNCTION(getPoolsByAdmin, 8);
 
         REGISTER_USER_PROCEDURE(createPool, 1);
         REGISTER_USER_PROCEDURE(registerAsset, 2);
