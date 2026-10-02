@@ -302,7 +302,30 @@
 #undef CONTRACT_STATE_TYPE
 #undef CONTRACT_STATE2_TYPE
 
-#define QREWARDS_CONTRACT_INDEX 29
+// Index reservations only: on the live chain, 29 = QPAYHUB (qubic/core PR #1015)
+// and 30 = another already-deployed contract. Neither is part of this fork; these
+// empty placeholders keep the positional array consistent so QREWARDS is index 31.
+#define QRWRSV29_CONTRACT_INDEX 29
+#define CONTRACT_INDEX QRWRSV29_CONTRACT_INDEX
+#define CONTRACT_STATE_TYPE QRWRSV29
+#define CONTRACT_STATE2_TYPE QRWRSV292
+#include "contracts/QRewardsReserved29.h"
+
+#undef CONTRACT_INDEX
+#undef CONTRACT_STATE_TYPE
+#undef CONTRACT_STATE2_TYPE
+
+#define QRWRSV30_CONTRACT_INDEX 30
+#define CONTRACT_INDEX QRWRSV30_CONTRACT_INDEX
+#define CONTRACT_STATE_TYPE QRWRSV30
+#define CONTRACT_STATE2_TYPE QRWRSV302
+#include "contracts/QRewardsReserved30.h"
+
+#undef CONTRACT_INDEX
+#undef CONTRACT_STATE_TYPE
+#undef CONTRACT_STATE2_TYPE
+
+#define QREWARDS_CONTRACT_INDEX 31
 #define CONTRACT_INDEX QREWARDS_CONTRACT_INDEX
 #define CONTRACT_STATE_TYPE QREWARDS
 #define CONTRACT_STATE2_TYPE QREWARDS2
@@ -423,10 +446,11 @@ constexpr struct ContractDescription
     {"QUSINO", 208, 10000, sizeof(QUSINO::StateData)}, // proposal in epoch 206, IPO in 207, construction and first use in 208
     {"ESCROW", 210, 10000, sizeof(ESCROW::StateData)}, // proposal in epoch 208, IPO in 209, construction and first use in 210
     {"GGWP", 218, 10000, sizeof(WOLFPACK::StateData)}, // proposal in epoch 216, IPO in 217, construction and first use in 218
-    // NOTE: index 29 here is a placeholder. On the live chain, index 29 is taken by
-    // QPAYHUB (qubic/core PR #1015). QREWARDS must be assigned a UNIQUE index after
-    // QPAYHUB at deployment, and its qpayhubAddress set to QPAYHUB's id(29,0,0,0).
-    {"QREWARD", 230, 10000, sizeof(QREWARDS::StateData)}, // asset ticker <=7 chars; construction epoch is a placeholder
+    // Index reservations (not in this fork): 29 = QPAYHUB (qubic/core PR #1015),
+    // 30 = another already-deployed contract. Empty placeholders so QREWARDS is 31.
+    {"RSV29", 231, 10000, sizeof(QRWRSV29::StateData)},
+    {"RSV30", 231, 10000, sizeof(QRWRSV30::StateData)},
+    {"QREWARD", 232, 10000, sizeof(QREWARDS::StateData)}, // index 31; asset ticker <=7 chars; construction epoch placeholder
     // new contracts should be added above this line
 #ifdef INCLUDE_CONTRACT_TEST_EXAMPLES
     {"TESTEXA", 138, 10000, sizeof(TESTEXA::StateData)},
@@ -559,6 +583,8 @@ static void initializeContracts()
     REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(QUSINO);
     REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(ESCROW);
     REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(WOLFPACK);
+    REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(QRWRSV29);
+    REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(QRWRSV30);
     REGISTER_CONTRACT_FUNCTIONS_AND_PROCEDURES(QREWARDS);
     // new contracts should be added above this line
 #ifdef INCLUDE_CONTRACT_TEST_EXAMPLES
