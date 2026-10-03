@@ -160,12 +160,13 @@ public:
         HashMap<id, uint64, QREWARDS_MAX_FUNDERS> fundingRoute;
         uint32 numPools;
         id platformOwner;
-        // Receives the 15% QPAYHUB share of fees. QPAYHUB (qubic/core PR #1015) is
-        // CONTRACT_INDEX 29, so set this to id(29, 0, 0, 0). A plain qpi.transfer there
-        // is auto-credited to QPAYHUB's feePool by its POST_INCOMING_TRANSFER (accepts
-        // qpiTransfer), which QPAYHUB then splits each epoch 10% its shareholders /
-        // 1% burn / 89% QPAY token holders. No procedure call needed.
+        // Receives the 15% QPAYHUB share of CREATE/OPERATING fees. QPAYHUB
+        // (qubic/core PR #1015) is CONTRACT_INDEX 29, so set this to id(29, 0, 0, 0):
+        // a plain qpi.transfer there is auto-credited to QPAYHUB's feePool.
         id qpayhubAddress;
+        // Receives the QPAY share (80%) of the 5% DIVIDEND fee, in both QU and tokens.
+        // Initialized to the QPAY token dividends wallet; protocol-owner tunable.
+        id qpayTokenDividendsAddress;
         uint64 createPoolFee;
         uint64 operatingFee;   // per-pool per-epoch
     };
@@ -306,13 +307,14 @@ protected:
         {
             qpi.distributeDividends((sint64)locals.perShare);
         }
-        // Everything not distributed to shareholders (the 80% + rounding) goes to QPAYHUB.
+        // Everything not distributed to shareholders (the 80% + rounding) goes to the
+        // QPAY token dividends address.
         locals.toQpayhub = input.amount - locals.actualSh;
         if (locals.toQpayhub > 0)
         {
-            if (state.get().qpayhubAddress != NULL_ID)
+            if (state.get().qpayTokenDividendsAddress != NULL_ID)
             {
-                qpi.transfer(state.get().qpayhubAddress, (sint64)locals.toQpayhub);
+                qpi.transfer(state.get().qpayTokenDividendsAddress, (sint64)locals.toQpayhub);
             }
             else
             {
@@ -575,7 +577,8 @@ public:
         locals.oldBal = locals.pos.profit;
 
         // 1) settle pending dividends for EVERY currency at the OLD balance.
-        for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+        // Pay token currencies before QU (highest slot first; slot 0 = QU is last).
+        for (locals.k = locals.meta.numCurrencies; locals.k-- > 0; )
         {
             locals.cur = locals.meta.currencies.get(locals.k);
             locals.pt = div(locals.oldBal * locals.cur.acc, QREWARDS_ACC_SCALE);
@@ -660,7 +663,8 @@ public:
             output.returnCode = QREWARDS_SUCCESS;
             return;
         }
-        for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+        // Pay token currencies before QU (highest slot first; slot 0 = QU is last).
+        for (locals.k = locals.meta.numCurrencies; locals.k-- > 0; )
         {
             locals.cur = locals.meta.currencies.get(locals.k);
             locals.pt = div(locals.pos.profit * locals.cur.acc, QREWARDS_ACC_SCALE);
@@ -750,13 +754,13 @@ public:
                 state.mut().pendingDivFeeQU += locals.fee;
                 locals.rev -= locals.fee;
             }
-            else if (state.get().qpayhubAddress != NULL_ID
+            else if (state.get().qpayTokenDividendsAddress != NULL_ID
                      && qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
-                            SELF, SELF, (sint64)locals.fee, state.get().qpayhubAddress) >= 0)
+                            SELF, SELF, (sint64)locals.fee, state.get().qpayTokenDividendsAddress) >= 0)
             {
                 locals.rev -= locals.fee;
             }
-            // else (asset with no QPAYHUB address, or transfer failed): no fee taken.
+            // else (token with no QPAY dividends address, or transfer failed): no fee taken.
         }
 
         locals.cur.lifetime += locals.rev;
@@ -829,6 +833,16 @@ public:
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
         state.mut().qpayhubAddress = input.qpayhubAddress;
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    struct setQpayTokenDividendsAddress_input { id addr; };
+    struct setQpayTokenDividendsAddress_output { sint32 returnCode; };
+    PUBLIC_PROCEDURE(setQpayTokenDividendsAddress)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
+        state.mut().qpayTokenDividendsAddress = input.addr;
         output.returnCode = QREWARDS_SUCCESS;
     }
 
@@ -1031,11 +1045,12 @@ public:
     }
 
     struct getPlatform_input { };
-    struct getPlatform_output { id platformOwner; id qpayhubAddress; uint64 createPoolFee; uint64 operatingFee; uint32 numPools; };
+    struct getPlatform_output { id platformOwner; id qpayhubAddress; id qpayTokenDividendsAddress; uint64 createPoolFee; uint64 operatingFee; uint32 numPools; };
     PUBLIC_FUNCTION(getPlatform)
     {
         output.platformOwner = state.get().platformOwner;
         output.qpayhubAddress = state.get().qpayhubAddress;
+        output.qpayTokenDividendsAddress = state.get().qpayTokenDividendsAddress;
         output.createPoolFee = state.get().createPoolFee;
         output.operatingFee = state.get().operatingFee;
         output.numPools = state.get().numPools;
@@ -1182,12 +1197,15 @@ public:
         REGISTER_USER_PROCEDURE(depositOperating, 15);
         REGISTER_USER_PROCEDURE(setQpayhubAddress, 16);
         REGISTER_USER_PROCEDURE(setExcludedAddress, 17);
+        REGISTER_USER_PROCEDURE(setQpayTokenDividendsAddress, 18);
     }
 
     INITIALIZE()
     {
         state.mut().platformOwner = NULL_ID;
         state.mut().qpayhubAddress = NULL_ID;
+        // QPAY token dividends wallet (receives the 80% QPAY share of the 5% dividend fee).
+        state.mut().qpayTokenDividendsAddress = ID(_Q, _P, _A, _Y, _N, _O, _W, _S, _W, _Z, _M, _G, _H, _F, _E, _A, _E, _V, _J, _X, _G, _Z, _A, _V, _S, _H, _A, _B, _A, _Z, _D, _D, _B, _D, _I, _H, _T, _E, _B, _O, _P, _C, _O, _G, _H, _R, _G, _B, _C, _Y, _C, _U, _Z, _O, _H, _C);
         state.mut().createPoolFee = QREWARDS_DEFAULT_CREATE_FEE;
         state.mut().operatingFee = QREWARDS_DEFAULT_OPERATING_FEE;
         state.mut().pendingDivFeeQU = 0;
