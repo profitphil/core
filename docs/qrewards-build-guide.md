@@ -17,6 +17,7 @@
 | State size | ~200–260 MB (well under the 1 GB cap). |
 | Dividend currency | **QU**, directed per pool via `depositDividend(poolId)`. |
 | Dividend denominator | **Distributed only**, per pool; remainder carry; `pendingRevenue` buffer. |
+| Dividend fee | **5%** of every deposit (QU **and** tokens), split **80% QPAY address / 20% QREWARDS shareholders**; the remaining **95% reaches holders**. |
 | Token | **Soulbound** internal accounting (combined `{profit,debt}` value), not transferable. |
 | Pool creation | **Open**. Fee **5,000,000 QU** (protocol-owner tunable), split **70% QREWARDS shareholders / 15% QPAYHUB address / 15% burn**. Any excess seeds the pool's operating balance. |
 | Operating fee | **100,000 QU/epoch per pool** (protocol-owner tunable), drawn at `END_EPOCH` from a per-pool operating balance the admin tops up (`depositOperating`); same 70/15/15 split. Underfunded → **paused up to `QREWARDS_MAX_MISSED_EPOCHS` (2) epochs, then deactivated**. |
@@ -89,7 +90,11 @@ Per-holder pending = `pos.profit*meta.acc/SCALE - pos.debt`. **Settle before cha
 
 **Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)` · `setFundingRoute(14)` · `depositOperating(15)` (top up a pool's operating balance) · `setQpayhubAddress(16)` (protocol owner) · `setExcludedAddress(17)` (pool admin) · `setQpayTokenDividendsAddress(18)` (protocol owner).
 
-**Dividend fee:** every dividend deposit is skimmed **5%**; **95% reaches holders**. The 5% is split **80% → the QPAY token dividends address / 20% → QREWARDS shareholders**. The QPAY address (`qpayTokenDividendsAddress`) is initialized to the QPAY dividends wallet (`QPAYNOW…`) and is protocol-owner-tunable via `setQpayTokenDividendsAddress`. For QU it accrues to `pendingDivFeeQU` and flushes at `END_EPOCH` (20% via `distributeDividends`, 80% transferred to the QPAY address; burned if unset). For a **token** dividend the whole 5% goes to the QPAY address (the 20% shareholder leg needs QU); if that address is unset, no fee is taken on tokens. (This is separate from `qpayhubAddress`, which still takes the 15% of create/operating fees → QPAYHUB's feePool.)
+**Dividend fee:** every dividend deposit is skimmed **5%**; **95% reaches holders**. The 5% is split **80% → the QPAY token dividends address / 20% → QREWARDS shareholders** — for **both** QU and token dividends. The QPAY address (`qpayTokenDividendsAddress`) is initialized to the QPAY dividends wallet (`QPAYNOW…`) and is protocol-owner-tunable via `setQpayTokenDividendsAddress`.
+- **QU dividend:** the whole 5% accrues to `pendingDivFeeQU` and flushes at `END_EPOCH` — 20% via `qpi.distributeDividends`, 80% (+ rounding) transferred to the QPAY address (burned if unset).
+- **Token dividend:** settled inline at deposit. `qpi.distributeDividends` is QU-only, so the 20% shareholder leg is paid **in the token itself** by iterating the QREWARDS contract share asset (`assetName = "QREWARD"` packed = `19230739006837329`, `issuer = NULL_ID`) and transferring `perShare = floor(20%fee / NUMBER_OF_COMPUTORS)` × shares to each possessor (`DistributeTokenToShareholders`). Everything not distributed to shareholders — the 80% plus per-share rounding dust and any failed shareholder transfers — goes to the QPAY address. If the QPAY address is unset, no fee is taken on tokens. Note the per-share flooring means the shareholder leg only pays out once `20% of the fee ≥ NUMBER_OF_COMPUTORS (676)`; below that it rounds to 0 and the whole fee folds to QPAY.
+
+(This is separate from `qpayhubAddress`, which still takes the 15% of create/operating fees → QPAYHUB's feePool.)
 
 **Payout order:** when a holder is settled (`claimDividends`/`syncProfit`), **token currencies are paid before QU** (highest currency slot first; slot 0 = QU last).
 

@@ -12,6 +12,7 @@ static id qrUser(unsigned long long i)
 static const id QR_ADMIN = qrUser(100);
 static const id QR_ALICE = qrUser(1);
 static const id QR_BOB   = qrUser(2);
+static const id QR_CAROL = qrUser(3); // QREWARDS shareholder (contract shares)
 static const uint64 QR_TOKEN = 123456789ULL; // reward-earning asset
 static const uint64 QR_DOGE  = 987654321ULL; // a dividend-currency asset
 
@@ -24,6 +25,7 @@ public:
     uint32 poolNumAssets(uint64 p) const { return poolMeta.get(p).numAssets; }
     uint8 poolNumCurrencies(uint64 p) const { return poolMeta.get(p).numCurrencies; }
     uint64 pendingDivFeeQUOf() const { return pendingDivFeeQU; }
+    id qpayTokenAddrOf() const { return qpayTokenDividendsAddress; }
 };
 
 class ContractTestingQRewards : public ContractTesting
@@ -245,6 +247,19 @@ public:
         callFunction(QREWARDS_CONTRACT_INDEX, 10, input, output);
         return output.excluded;
     }
+
+    // Sum the shares of (assetName, issuer) possessed by `holder`, across any managing contract.
+    uint64 tokenBalanceOf(uint64 assetName, const id& issuer, const id& holder)
+    {
+        Asset asset(issuer, assetName);
+        uint64 total = 0;
+        for (AssetPossessionIterator iter(asset); !iter.reachedEnd(); iter.next())
+        {
+            if (iter.possessor() == holder)
+                total += (uint64)iter.numberOfPossessedShares();
+        }
+        return total;
+    }
 };
 
 TEST(ContractQRewards, CreatePoolAndEntitlement)
@@ -329,11 +344,14 @@ TEST(ContractQRewards, AssetDividendAccounting)
     t.grantMgmtToQRewards(QR_BOB, QR_DOGE, QR_BOB, 1500LL);
     EXPECT_EQ(t.depositAsset(QR_BOB, pool, 1, 1500ULL), QREWARDS_SUCCESS);
 
-    // Alice (sole holder) should be owed all 1500 QDOGE in slot 1, 0 QU in slot 0.
+    // 5% token dividend fee applies: 1500 -> 75 fee, 1425 reaches the sole holder.
+    // No QREWARDS shareholders are seeded in this fixture, so the 20% shareholder leg
+    // rounds/falls back entirely to the QPAY token dividends address (whole 75).
     uint64 pend0 = 0, pend1 = 0;
     t.getPosition(pool, QR_ALICE, pend0, pend1);
     EXPECT_EQ(pend0, 0u);
-    EXPECT_EQ(pend1, 1500u);
+    EXPECT_EQ(pend1, 1425u);
+    EXPECT_EQ(t.tokenBalanceOf(QR_DOGE, QR_BOB, t.getState()->qpayTokenAddrOf()), 75u);
     EXPECT_EQ(t.claimDividends(QR_ALICE, pool), 1u); // paid in QDOGE
 }
 
@@ -515,4 +533,43 @@ TEST(ContractQRewards, DividendFeeFivePercent)
     // END_EPOCH flushes the accrued fee (80/20).
     t.endEpoch();
     EXPECT_EQ(t.getState()->pendingDivFeeQUOf(), 0u);
+}
+
+// Token dividend fee is split like the QU fee: 20% to QREWARDS shareholders (paid in the
+// token itself, since distributeDividends is QU-only), 80% (+dust) to the QPAY address.
+TEST(ContractQRewards, TokenDividendFeeSplit)
+{
+    ContractTestingQRewards t;
+
+    // Seed QREWARDS shareholders: Carol owns/possesses all contract shares.
+    std::vector<std::pair<m256i, unsigned int>> owners = { { QR_CAROL, NUMBER_OF_COMPUTORS } };
+    issueContractShares(QREWARDS_CONTRACT_INDEX, owners, false);
+
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_ALICE, 5000000000ULL);
+    increaseEnergy(QR_BOB, 5000000000ULL);
+
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+    t.issueAsset(QR_ALICE, QR_TOKEN, 50000000LL);
+    t.registerAsset(QR_ADMIN, pool, QR_TOKEN, QR_ALICE, 1000000ULL, 10000, 0);
+    t.syncProfit(QR_ALICE, pool, QR_ALICE); // Alice => 75 reward tokens (sole holder)
+    ASSERT_EQ(t.getState()->poolTotalDistributed(pool), 75u);
+
+    // QDOGE as a second dividend currency (slot 1).
+    t.issueAsset(QR_BOB, QR_DOGE, 5000000LL);
+    EXPECT_EQ(t.addDivCurrency(QR_ADMIN, pool, QR_DOGE, QR_BOB), QREWARDS_SUCCESS);
+
+    // Deposit 150,000 QDOGE. 5% fee = 7,500.
+    //   shareholder leg = 20% of 7,500 = 1,500; perShare = 1500/676 = 2; distributed = 2*676 = 1,352 -> Carol.
+    //   QPAY leg = 7,500 - 1,352 = 6,148 -> QPAY token dividends address.
+    //   net to the pool = 142,500 -> owed to Alice (142500 = 75*1900, exact).
+    t.grantMgmtToQRewards(QR_BOB, QR_DOGE, QR_BOB, 150000LL);
+    EXPECT_EQ(t.depositAsset(QR_BOB, pool, 1, 150000ULL), QREWARDS_SUCCESS);
+
+    uint64 pend0 = 0, pend1 = 0;
+    t.getPosition(pool, QR_ALICE, pend0, pend1);
+    EXPECT_EQ(pend0, 0u);
+    EXPECT_EQ(pend1, 142500u);
+    EXPECT_EQ(t.tokenBalanceOf(QR_DOGE, QR_BOB, QR_CAROL), 1352u);
+    EXPECT_EQ(t.tokenBalanceOf(QR_DOGE, QR_BOB, t.getState()->qpayTokenAddrOf()), 6148u);
 }

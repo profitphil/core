@@ -37,6 +37,7 @@ constexpr uint64 QREWARDS_DIVIDEND_FEE_PCT     = 5;              // 5% fee skimm
 constexpr uint64 QREWARDS_DIVFEE_QPAYHUB_PCT   = 80;            // of the 5% fee: 80% QPAYHUB
 constexpr uint64 QREWARDS_DIVFEE_SHAREHOLDER_PCT = 20;          // of the 5% fee: 20% QREWARDS shareholders
 constexpr uint64 QREWARDS_MAX_EXCLUSIONS       = 65536;         // (poolId,address) exclusions, shared
+constexpr uint64 QREWARDS_CONTRACT_ASSET_NAME  = 19230739006837329ULL; // packed "QREWARD" (contract shares, issuer NULL_ID)
 
 // return codes
 constexpr sint32 QREWARDS_SUCCESS            = 0;
@@ -320,6 +321,39 @@ protected:
             {
                 qpi.burn((sint64)locals.toQpayhub);
             }
+        }
+    }
+
+    // Distribute an asset (token) held by SELF pro-rata to QREWARDS shareholders.
+    // distributeDividends() only works for QU, so for the 20% shareholder leg of a
+    // *token* dividend fee we iterate the contract share asset and transfer per-share.
+    // `distributed` is the amount actually sent out (<= amount; the rounding dust and
+    // any failed transfers stay with SELF and are folded back by the caller to QPAY).
+    struct DistributeTokenToShareholders_input { uint64 assetName; id issuer; uint64 amount; };
+    struct DistributeTokenToShareholders_output { uint64 distributed; };
+    struct DistributeTokenToShareholders_locals { Asset shareAsset; AssetPossessionIterator iter; uint64 perShare; sint64 held; uint64 send; };
+    PRIVATE_PROCEDURE_WITH_LOCALS(DistributeTokenToShareholders)
+    {
+        output.distributed = 0;
+        if (input.amount == 0) return;
+        locals.perShare = div(input.amount, (uint64)NUMBER_OF_COMPUTORS);
+        if (locals.perShare == 0) return;
+        locals.shareAsset.assetName = QREWARDS_CONTRACT_ASSET_NAME;
+        locals.shareAsset.issuer = NULL_ID;
+        locals.iter.begin(locals.shareAsset);
+        while (!locals.iter.reachedEnd())
+        {
+            locals.held = locals.iter.numberOfPossessedShares();
+            if (locals.held > 0)
+            {
+                locals.send = locals.perShare * (uint64)locals.held;
+                if (qpi.transferShareOwnershipAndPossession(input.assetName, input.issuer,
+                        SELF, SELF, (sint64)locals.send, locals.iter.possessor()) >= 0)
+                {
+                    output.distributed += locals.send;
+                }
+            }
+            locals.iter.next();
         }
     }
 
@@ -701,6 +735,9 @@ public:
         bit isQU;
         uint64 num;
         uint64 inc;
+        uint64 qpayPart;
+        DistributeTokenToShareholders_input dtsi;
+        DistributeTokenToShareholders_output dtso;
         QRewardsLogger log;
     };
     PUBLIC_PROCEDURE_WITH_LOCALS(depositDividend)
@@ -744,8 +781,14 @@ public:
 
         if (locals.rev == 0) { output.returnCode = QREWARDS_SUCCESS; return; }
 
-        // 5% dividend fee. QU: accrue to pendingDivFeeQU (flushed 80/20 at END_EPOCH).
-        // Asset: whole 5% to QPAYHUB (the 20% shareholder leg needs QU, so assets go 100%).
+        // 5% dividend fee, split 80% QPAY / 20% QREWARDS shareholders.
+        //  - QU  : accrue the whole fee to pendingDivFeeQU; the 80/20 split is applied
+        //          at END_EPOCH via DistributeDivFee.
+        //  - Token: distributed inline here. 20% is sent to the share holders pro-rata by
+        //          iterating the contract share asset (distributeDividends is QU-only), and
+        //          the remainder (80% + rounding dust + any failed shareholder sends) goes
+        //          to the QPAY token dividends address. If no QPAY address is set, the whole
+        //          fee is left in the pool revenue (no fee taken) rather than stranded.
         locals.fee = div(locals.rev * QREWARDS_DIVIDEND_FEE_PCT, 100ULL);
         if (locals.fee > 0)
         {
@@ -754,13 +797,27 @@ public:
                 state.mut().pendingDivFeeQU += locals.fee;
                 locals.rev -= locals.fee;
             }
-            else if (state.get().qpayTokenDividendsAddress != NULL_ID
-                     && qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
-                            SELF, SELF, (sint64)locals.fee, state.get().qpayTokenDividendsAddress) >= 0)
+            else if (state.get().qpayTokenDividendsAddress != NULL_ID)
             {
-                locals.rev -= locals.fee;
+                locals.dtsi.assetName = locals.cur.assetName;
+                locals.dtsi.issuer = locals.cur.issuer;
+                locals.dtsi.amount = div(locals.fee * QREWARDS_DIVFEE_SHAREHOLDER_PCT, 100ULL);
+                CALL(DistributeTokenToShareholders, locals.dtsi, locals.dtso);
+                // Everything not distributed to shareholders (80% + dust) -> QPAY address.
+                locals.qpayPart = locals.fee - locals.dtso.distributed;
+                if (locals.qpayPart == 0
+                    || qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
+                           SELF, SELF, (sint64)locals.qpayPart, state.get().qpayTokenDividendsAddress) >= 0)
+                {
+                    locals.rev -= locals.fee;
+                }
+                else
+                {
+                    // QPAY leg failed: only the shareholder portion actually left SELF.
+                    locals.rev -= locals.dtso.distributed;
+                }
             }
-            // else (token with no QPAY dividends address, or transfer failed): no fee taken.
+            // else (token with no QPAY dividends address): no fee taken.
         }
 
         locals.cur.lifetime += locals.rev;
