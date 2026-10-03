@@ -13,6 +13,7 @@ static const id QR_ADMIN = qrUser(100);
 static const id QR_ALICE = qrUser(1);
 static const id QR_BOB   = qrUser(2);
 static const id QR_CAROL = qrUser(3); // QREWARDS shareholder (contract shares)
+static const id QR_HUB   = qrUser(4); // stands in for the QPAYHUB dividends account
 static const uint64 QR_TOKEN = 123456789ULL; // reward-earning asset
 static const uint64 QR_DOGE  = 987654321ULL; // a dividend-currency asset
 
@@ -246,6 +247,22 @@ public:
         QREWARDS::isExcluded_output output;
         callFunction(QREWARDS_CONTRACT_INDEX, 10, input, output);
         return output.excluded;
+    }
+
+    sint32 setPlatformOwner(const id& caller, const id& newOwner)
+    {
+        QREWARDS::setPlatformOwner_input input{ newOwner };
+        QREWARDS::setPlatformOwner_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 10, input, output, caller, 0);
+        return output.returnCode;
+    }
+
+    sint32 setQpayhubAddr(const id& caller, const id& addr)
+    {
+        QREWARDS::setQpayhubAddress_input input{ addr };
+        QREWARDS::setQpayhubAddress_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 16, input, output, caller, 0);
+        return output.returnCode;
     }
 
     // Sum the shares of (assetName, issuer) possessed by `holder`, across any managing contract.
@@ -572,4 +589,43 @@ TEST(ContractQRewards, TokenDividendFeeSplit)
     EXPECT_EQ(pend1, 142500u);
     EXPECT_EQ(t.tokenBalanceOf(QR_DOGE, QR_BOB, QR_CAROL), 1352u);
     EXPECT_EQ(t.tokenBalanceOf(QR_DOGE, QR_BOB, t.getState()->qpayTokenAddrOf()), 6148u);
+}
+
+// QU dividend fee routing: 20% -> QREWARDS shareholders (distributeDividends),
+// 80% (+rounding) -> the QPAYHUB dividends account (qpayhubAddress), NOT the QPAY wallet.
+TEST(ContractQRewards, QuDividendFeeRouting)
+{
+    ContractTestingQRewards t;
+
+    // Carol owns/possesses all contract shares.
+    std::vector<std::pair<m256i, unsigned int>> owners = { { QR_CAROL, NUMBER_OF_COMPUTORS } };
+    issueContractShares(QREWARDS_CONTRACT_INDEX, owners, false);
+
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_ALICE, 5000000000ULL);
+    increaseEnergy(QR_BOB, 5000000000ULL);
+
+    // Claim platform ownership (bootstrap from NULL) and set the QPAYHUB dividends account.
+    EXPECT_EQ(t.setPlatformOwner(QR_ADMIN, QR_ADMIN), QREWARDS_SUCCESS);
+    EXPECT_EQ(t.setQpayhubAddr(QR_ADMIN, QR_HUB), QREWARDS_SUCCESS);
+
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+    t.issueAsset(QR_ALICE, QR_TOKEN, 50000000LL);
+    t.registerAsset(QR_ADMIN, pool, QR_TOKEN, QR_ALICE, 1000000ULL, 10000, 0);
+    t.syncProfit(QR_ALICE, pool, QR_ALICE);
+
+    // Snapshot AFTER createPool so the create-fee split (which also pays QR_HUB and Carol)
+    // is in the baseline; the deltas below isolate the dividend-fee legs.
+    long long carolBefore = getBalance(QR_CAROL);
+    long long hubBefore = getBalance(QR_HUB);
+
+    // Deposit 1,352,000 QU: fee = 67,600. Shareholder leg = 20% = 13,520; perShare = 20;
+    // distributed = 20*676 = 13,520 -> Carol. QPAYHUB leg = 67,600 - 13,520 = 54,080 -> QR_HUB.
+    t.depositQU(QR_BOB, pool, 1352000ULL);
+    EXPECT_EQ(t.getState()->pendingDivFeeQUOf(), 67600u);
+    t.endEpoch();
+    EXPECT_EQ(t.getState()->pendingDivFeeQUOf(), 0u);
+
+    EXPECT_EQ(getBalance(QR_CAROL) - carolBefore, 13520LL); // 20% to shareholders
+    EXPECT_EQ(getBalance(QR_HUB) - hubBefore, 54080LL);     // 80% to QPAYHUB account
 }

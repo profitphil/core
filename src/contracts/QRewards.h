@@ -293,8 +293,10 @@ protected:
         }
     }
 
-    // Split a QU dividend fee: 80% to QPAYHUB, 20% to QREWARDS shareholders.
-    // (If no QPAYHUB address is set, its 80% is burned.) Remainder -> QPAYHUB side.
+    // Split a QU dividend fee: 20% to QREWARDS shareholders, 80% (+ rounding) to the
+    // QPAYHUB dividends account. QPAYHUB's POST_INCOMING_TRANSFER auto-credits plain QU
+    // into its feePool, so a bare qpi.transfer is all that's needed. If no QPAYHUB
+    // address is set, that 80% is burned instead.
     struct DistributeDivFee_input { uint64 amount; };
     struct DistributeDivFee_output { };
     struct DistributeDivFee_locals { uint64 shTotal; uint64 perShare; uint64 actualSh; uint64 toQpayhub; };
@@ -309,13 +311,13 @@ protected:
             qpi.distributeDividends((sint64)locals.perShare);
         }
         // Everything not distributed to shareholders (the 80% + rounding) goes to the
-        // QPAY token dividends address.
+        // QPAYHUB dividends account (its feePool, via auto-credited QU transfer).
         locals.toQpayhub = input.amount - locals.actualSh;
         if (locals.toQpayhub > 0)
         {
-            if (state.get().qpayTokenDividendsAddress != NULL_ID)
+            if (state.get().qpayhubAddress != NULL_ID)
             {
-                qpi.transfer(state.get().qpayTokenDividendsAddress, (sint64)locals.toQpayhub);
+                qpi.transfer(state.get().qpayhubAddress, (sint64)locals.toQpayhub);
             }
             else
             {
