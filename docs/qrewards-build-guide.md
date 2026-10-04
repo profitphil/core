@@ -1,183 +1,213 @@
 # QREWARDS — Open Multi-Pool Loyalty & Dividend Platform: Build Guide
 
-> Reference implementation: `src/contracts/QRewards.h` (multi-pool / open to anyone).
-> Purpose: let anyone create a **pool** with its own internal **soulbound** reward token.
-> Holders of a pool's registered ecosystem assets earn that pool's token; outside
-> contracts (or anyone) feed QU into a **specific pool** via `depositDividend(poolId)`,
-> paid pro-rata to that pool's distributed balances. Pools are fully isolated.
+> Reference implementation: `src/contracts/QRewards.h`
+> Purpose: let anyone create a **pool**. Holding a pool's registered ecosystem assets
+> earns a **weighted share** of that pool's dividends. Outside contracts (or anyone)
+> feed QU or tokens into a **specific pool** via `depositDividend(poolId, …)`; the
+> accumulated pot is paid out **at each epoch end, pro-rata by live holdings**. Pools
+> are fully isolated: a pool can only ever pay out what was deposited to it.
 
 ---
 
-## 1. Decisions baked in
+## 1. Distribution model — pure snapshot (why there is no claim step)
+
+QREWARDS follows the **qRWA pattern** (`src/contracts/qRWA.h`): it does **not** keep a
+persistent reward-token balance. Instead:
+
+1. Every `depositDividend` (minus the 5% fee) accumulates into a per-currency **pot**
+   for the pool.
+2. At **`END_EPOCH`**, for each active pool the contract reads **live holdings straight
+   from the asset ledger**, computes each holder's weight, and transfers out the pot
+   pro-rata by weight — QU via `qpi.transfer`, tokens via `transferShareOwnershipAndPossession`.
+
+**Why this matters:** because every epoch re-reads the real ledger, a holder who sold
+their tokens has a live balance of 0 and is paid nothing, and the same tokens can never
+be counted under two positions. There are **no stale "ghost" balances**, no double-count,
+and therefore **no `claimDividends` and no `syncProfit`** — holders are simply paid.
+
+This replaced an earlier MasterChef-style accumulator whose stored per-user "points"
+could drift from reality (a seller who was never re-synced kept earning, and a buyer of
+the same tokens was counted a second time, inflating the denominator). The snapshot model
+removes that whole class of bug at the root.
+
+### Scale & timing caveats (read these)
+- **Scale:** `END_EPOCH` iterates each active pool's registered assets' holders into a
+  scratch map of up to `QREWARDS_SNAPSHOT_CAP = 16384` unique holders per pool. This is
+  sized for **a handful of active pools of up to a few thousand holders each** (the design
+  target). It is *not* a mass sweep of thousands of busy pools in one epoch.
+- **Timing:** distribution uses the **END_EPOCH snapshot only**. That fully prevents
+  stale/ghost over-payment. It does **not** by itself stop someone buying a large position
+  right before the epoch boundary to grab that epoch's dividend and selling after. qRWA
+  blocks that with a `min(begin-epoch, end-epoch)` rule; adding it here would require a
+  `BEGIN_EPOCH` snapshot kept through the epoch (more state/code). Ship end-only first; add
+  min(begin,end) if dividend-sniping ever matters.
+
+---
+
+## 2. Decisions baked in
 
 | Topic | Decision |
 |---|---|
-| Multi-tenant | Anyone can `createPool`; each pool has its own admin, token, registry, dividends. |
-| Scale | `MAX_POOLS = 1024`, position capacity `2²² = 4,194,304` (poolId,wallet) pairs. |
-| State size | ~200–260 MB (well under the 1 GB cap). |
-| Dividend currency | **QU**, directed per pool via `depositDividend(poolId)`. |
-| Dividend denominator | **Distributed only**, per pool; remainder carry; `pendingRevenue` buffer. |
-| Dividend fee | **5%** of every deposit (QU **and** tokens), split **80% / 20%**: 20% → QREWARDS shareholders; 80% → **QPAYHUB dividends account for QU**, **QPAY wallet for tokens**. The remaining **95% reaches holders**. |
-| Token | **Soulbound** internal accounting (combined `{profit,debt}` value), not transferable. |
+| Multi-tenant | Anyone can `createPool`; each pool has its own admin, registry, dividend pots. |
+| Scale | `MAX_POOLS = 1024`; per-epoch snapshot `QREWARDS_SNAPSHOT_CAP = 16384` holders/pool. |
+| State size | ~10–15 MB (the 4.2M-position store is gone). |
+| Reward basis | **Live holdings**, read each epoch; no persistent reward-token balance. |
+| Dividend currencies | **QU** (slot 0) + up to 3 asset currencies per pool (`MAX_DIV_CURRENCIES = 4`). |
+| Distribution | At `END_EPOCH`, each pool's per-currency **pot** split pro-rata by live weight. Rounding dust carries to the next epoch's pot. |
+| Dividend fee | **5%** of every deposit (QU **and** tokens), split **80% / 20%**: 20% → QREWARDS shareholders; 80% → **QPAYHUB dividends account for QU**, **QPAY wallet for tokens**. **95% reaches holders.** |
 | Pool creation | **Open**. Fee **5,000,000 QU** (protocol-owner tunable), split **70% QREWARDS shareholders / 15% QPAYHUB address / 15% burn**. Any excess seeds the pool's operating balance. |
-| Operating fee | **100,000 QU/epoch per pool** (protocol-owner tunable), drawn at `END_EPOCH` from a per-pool operating balance the admin tops up (`depositOperating`); same 70/15/15 split. Underfunded → **paused up to `QREWARDS_MAX_MISSED_EPOCHS` (2) epochs, then deactivated**. |
-| Keys | A position key = `K12(poolId, wallet)`; `wallet` is a real Qubic public key. |
-| Split-resistance | Per-pool reward = proportional base × non-decreasing whole-balance concentration multiplier × admin-set price weight. |
+| Operating fee | **100,000 QU/epoch per pool** (protocol-owner tunable), drawn at `END_EPOCH` from a per-pool operating balance the admin tops up (`depositOperating`); same 70/15/15 split. Underfunded → **paused up to `QREWARDS_MAX_MISSED_EPOCHS` (2) epochs, then deactivated**. A paused/inactive pool is skipped by distribution and its pot carries. |
+| Excluded addresses | Per-pool `setExcludedAddress`; an excluded address's weight is forced to 0 (earns nothing, dilutes nobody). |
+| Split-resistance | Per-asset weight = `(held/unit) × concentrationMultiplier × weightBps`; the multiplier rises with holding size, so splitting a balance across wallets never increases total weight. |
 
 ---
 
-## 2. State layout (`src/contracts/QRewards.h`)
+## 3. State layout (`src/contracts/QRewards.h`)
 
 ```cpp
-struct AssetRule { uint64 assetName; id issuer; uint64 unit; uint32 weightBps; uint8 kind; uint8 active; };
-struct PoolMeta  { id admin; uint64 supply, totalDistributed, accRewardPerTokenScaled,
-                   accRemainder, pendingRevenue, lifetimeRevenue, label; uint32 numAssets; uint8 active; };
-struct Position  { uint64 profit; uint64 debt; };     // one combined HashMap value (saves the 32B key duplication)
-struct KeyProto  { uint64 poolId; id wallet; };       // zeroed then hashed -> composite key
+struct AssetRule   { uint64 assetName; id issuer; uint64 unit; uint32 weightBps; uint8 kind; uint8 active; };
+struct DivCurrency { uint64 assetName; id issuer; uint64 pot; uint64 lifetime; uint8 active; }; // assetName==0&&issuer==NULL_ID => QU
+struct PoolMeta    { id admin; uint64 label, operatingBalance, lastTotalWeight;
+                     uint32 numAssets, missedEpochs; uint8 numCurrencies, active, paused;
+                     Array<DivCurrency, 4> currencies; };
+struct KeyProto    { uint64 poolId; id wallet; };   // zeroed then hashed -> composite exclusion key
 
 struct StateData {
-    HashMap<id, Position, QREWARDS_POSITION_CAPACITY> positions; // key = K12(poolId, wallet)
-    Array<PoolMeta, QREWARDS_MAX_POOLS>  poolMeta;               // hot scalars (small)
-    Array<AssetRule, MAX_POOLS*MAX_ASSETS_PER_POOL> registry;   // flat: pool p asset i at p*MAX_ASSETS+i
+    HashMap<id, uint8,  QREWARDS_MAX_EXCLUSIONS> excluded;   // key = K12(poolId, address) -> 1
+    HashMap<id, uint64, QREWARDS_SNAPSHOT_CAP>   snapshot;   // scratch holder->weight, rebuilt per pool at END_EPOCH
+    uint64 pendingDivFeeQU;                                  // QU dividend-fee skim, flushed 80/20 at END_EPOCH
+    Array<PoolMeta, QREWARDS_MAX_POOLS>  poolMeta;
+    Array<AssetRule, MAX_POOLS*MAX_ASSETS_PER_POOL> registry; // flat: pool p asset i at p*MAX_ASSETS + i
+    HashMap<id, uint64, QREWARDS_MAX_FUNDERS> fundingRoute;   // sourceId -> poolId (tagged QU transfers)
     uint32 numPools;
-    id platformOwner;      // deployer; sets createPoolFee only
-    uint64 createPoolFee;  // QU, burned on createPool
+    id platformOwner, qpayhubAddress, qpayTokenDividendsAddress;
+    uint64 createPoolFee, operatingFee;
 };
 ```
 
-Layout choices that matter:
-- **Combined `{profit,debt}` value** — avoids storing the 32-byte key twice (one map, not two).
-- **`poolMeta` split from `registry`** — sync/claim read-modify-write only the ~small PoolMeta, never a multi-KB struct.
-- **Composite key must be hashed from a zeroed proto** (`setMemory(proto,0)` before setting fields) so padding bytes can't make `K12` nondeterministic. The hashed key is storage-only; payouts use the wallet id we already hold, so the key never needs reversing.
+Notes:
+- The **composite exclusion key** is hashed from a zeroed proto (`setMemory(proto,0)` before
+  setting fields) so padding bytes can't make `K12` nondeterministic.
+- `snapshot` is scratch: `reset()` at the start of each pool's distribution, rebuilt from the
+  live ledger, then iterated to pay out. It is `reset()` again at the end of `END_EPOCH`.
 
 ---
 
-## 3. Reward model (per pool, per asset)
+## 4. Reward / weight model (per pool, per asset)
 
 ```
-basePoints = held / unit                       // floor; held < unit => 0
-mult       = concentrationMultiplier(basePoints)  // bps, applied to the WHOLE balance
-PROFIT_a   = basePoints * mult * weightBps / (10000*10000)
-poolProfit = sum over the pool's registered assets
+basePoints = held / unit                              // floor; held < unit => 0  (held = live possessed shares)
+mult       = concentrationMultiplier(basePoints)      // bps
+weight_a   = basePoints * mult * weightBps / (10000*10000)
+weight     = Σ weight_a over the pool's active assets // a holder's total weight
 ```
 
-- **`unit`** sets accessibility (one base point). No unreachable tier.
-- **Concentration multiplier** (whole-balance, non-decreasing → split-proof): `≥1 →1.00×, ≥10 →1.25×, ≥50 →1.50×, ≥200 →2.00×`.
-- **`weightBps`** = admin-set relative price (a cheaper asset earns proportionally less).
-- Splitting a wallet's holdings never gains, because the multiplier applies to the whole balance (`m` non-decreasing ⇒ concentrated ≥ any split). Note: different *wallets* are different positions on-chain — no on-chain defence against one person using many wallets (needs off-chain identity).
+`concentrationMultiplier`: `≥200 → 2.0x`, `≥50 → 1.5x`, `≥10 → 1.25x`, `≥1 → 1.0x`, else 0.
+The multiplier is **per asset** (keyed on that asset's `basePoints`), so a holder's total
+weight is the sum of independent per-asset contributions — which is exactly what lets the
+`END_EPOCH` snapshot total everyone up by walking each asset's holder list once.
+
+`previewWeight(poolId, wallet)` returns this live weight; divide by `getPool().lastTotalWeight`
+for an approximate share of the next payout.
 
 ---
 
-## 4. Dividend accounting (per pool, distributed-only)
+## 5. `END_EPOCH` (the engine)
 
-MasterChef accumulator, `SCALE = 1e6`, denominator = that pool's `totalDistributed`:
-
-```
-depositDividend(poolId): rev = invocationReward + meta.pendingRevenue
-  if meta.totalDistributed > 0:
-      num = rev*SCALE + meta.accRemainder
-      inc = num / meta.totalDistributed; meta.acc += inc; meta.accRemainder = num - inc*meta.totalDistributed
-      meta.pendingRevenue = 0
-  else: meta.pendingRevenue = rev          // nobody to pay yet; QU stays in the contract
-```
-Per-holder pending = `pos.profit*meta.acc/SCALE - pos.debt`. **Settle before changing a balance**, then `pos.debt = pos.profit*meta.acc/SCALE`.
-
-**Isolation guarantee:** a pool's total claimable = `totalDistributed × acc`, and `acc` only rises from deposits *to that pool*. So even though all QU shares one contract balance, a pool can only ever pay out what was deposited to it — no cross-pool drain.
-
----
-
-## 5. Procedures & functions
-
-**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)` · `setPoolAdmin(5)` · `syncProfit(6)` (permissionless) · `claimDividends(7)` · `depositDividend(8)` · `setPlatformParams(9)` · `setPlatformOwner(10)` · `TransferShareManagementRights(11)` · `registerAssets(12)` (batch, ≤16) · `addDividendCurrency(13)` · `setFundingRoute(14)` · `depositOperating(15)` (top up a pool's operating balance) · `setQpayhubAddress(16)` (protocol owner) · `setExcludedAddress(17)` (pool admin) · `setQpayTokenDividendsAddress(18)` (protocol owner).
-
-**Dividend fee:** every dividend deposit is skimmed **5%**; **95% reaches holders**. The 5% is always split **80% / 20%**, with the 20% going to QREWARDS shareholders for both currencies — but the **80% recipient differs by currency**:
-- **QU dividend → 80% to the QPAYHUB dividends account (`qpayhubAddress`).** The whole 5% accrues to `pendingDivFeeQU` and flushes at `END_EPOCH`: 20% via `qpi.distributeDividends` to shareholders, 80% (+ rounding) via a bare `qpi.transfer` to `qpayhubAddress`, which QPAYHUB's `POST_INCOMING_TRANSFER` auto-credits into its `feePool`. If `qpayhubAddress` is unset, that 80% is **burned**.
-- **Token dividend → 80% to the QPAY wallet (`qpayTokenDividendsAddress`).** Settled inline at deposit. `qpi.distributeDividends` is QU-only, so the 20% shareholder leg is paid **in the token itself** by iterating the QREWARDS contract share asset (`assetName = "QREWARD"` packed = `19230739006837329`, `issuer = NULL_ID`) and transferring `perShare = floor(20%fee / NUMBER_OF_COMPUTORS)` × shares to each possessor (`DistributeTokenToShareholders`). Everything not distributed to shareholders — the 80% plus per-share rounding dust and any failed shareholder transfers — goes to `qpayTokenDividendsAddress` (the `QPAYNOW…` wallet, protocol-owner-tunable via `setQpayTokenDividendsAddress`). If that address is unset, **no fee is taken on tokens**. Note the per-share flooring means the shareholder leg only pays out once `20% of the fee ≥ NUMBER_OF_COMPUTORS (676)`; below that it rounds to 0 and the whole fee folds to the QPAY wallet.
-
-Why the two destinations: QPAYHUB's `feePool` only accepts **plain QU** (its `POST_INCOMING_TRANSFER` ignores incoming assets), so token fees can't be credited there and are sent to the QPAY wallet instead; the QU fee can and does go straight to QPAYHUB's dividend fund.
-
-(This is separate from `qpayhubAddress`'s other role: it also takes the 15% QPAYHUB slice of create/operating fees → QPAYHUB's feePool.)
-
-**Payout order:** when a holder is settled (`claimDividends`/`syncProfit`), **token currencies are paid before QU** (highest currency slot first; slot 0 = QU last).
-
-**Excluded addresses:** a pool admin calls `setExcludedAddress(poolId, address, excluded)` to exclude/re-include an address (stored as `K12(poolId,address)`). An excluded address's entitlement is forced to **0**, so it neither earns rewards nor receives dividends nor dilutes other holders. A newly-excluded holder with an existing balance is zeroed on its next `syncProfit` (permissionless, so anyone can trigger it). `isExcluded(poolId, address)` is the view.
-
-Fees (create + operating) are split **70% QREWARDS shareholders** (`qpi.distributeDividends`) / **15% to the protocol-owner-set QPAY address** / **15% burned** (if no QPAY address is set, that 15% is burned too). `setPlatformParams(createPoolFee, operatingFee)` and `setQpayhubAddress(addr)` are protocol-owner only.
-
-**How the 15% reaches QPAYHUB's dividend fund:** The latest QPAYHUB (qubic/core **PR #1015**, `src/contracts/QPayhub.h`, **CONTRACT_INDEX 29**) has no deposit procedure — its `POST_INCOMING_TRANSFER` auto-credits any plain QU sent to its address into its `feePool`, which it splits each epoch **10% QPAYHUB shareholders / 1% burn / 89% QPAY token holders** (`QPAYHUB_TOKEN_ASSETNAME = "QPAY"`). QREWARDS's `DistributeFee` already does `qpi.transfer(qpayhubAddress, 15%)`, which lands as a `qpiTransfer` → QPAYHUB `feePool`. So no QPAYHUB call is needed; just set `qpayhubAddress = id(29, 0, 0, 0)` once QPAYHUB is deployed.
-
-**Index:** QPAYHUB occupies **CONTRACT_INDEX 29**, index 30 is another already-deployed contract, so **QREWARDS is wired at index 31**. Indices 29/30 are not part of this fork, so they're held by empty placeholder contracts (`QRewardsReserved29.h`/`QRewardsReserved30.h`) purely to keep the positional contract array consistent — they carry no logic. QPAYHUB also now has an operator role and affiliate registrar (no longer fully admin-free), and its dividend token issuer is still a devnet placeholder to be re-pointed before mainnet. `END_EPOCH` draws the operating fee from every active pool, pausing the underfunded and deactivating after `QREWARDS_MAX_MISSED_EPOCHS`; paused pools reject `syncProfit`/`depositDividend` but still allow `claimDividends`.
-
-**Functions** (index): `getPosition(1)` · `previewProfit(2)` · `getPool(3)` · `getPoolAsset(4)` · `getPlatform(5)` · `getAllPoolAssets(6)` · `getFundingRoute(7)` · `getPoolsByAdmin(8)` (paginated, 256/page) · `getPositions(9)` (one user across ≤64 pools; each row has profit + pending per currency + a `valid` flag) · `isExcluded(10)`.
-
-### Multi-currency dividends
-
-Each pool can pay in up to `QREWARDS_MAX_DIV_CURRENCIES = 4` currencies. Slot 0 is **QU** by default (set at `createPool`); the pool admin adds asset currencies (e.g. QDOGE) with `addDividendCurrency(poolId, assetName, issuer)`. Every currency has its own accumulator, and each position carries a **per-currency reward debt** (`Position.debt[k]`). `claimDividends`/`syncProfit` settle **all** of a pool's currencies.
-
-`depositDividend(poolId, currencyIndex, amount)`:
-- **QU currency** (slot where `assetName==0`): QU is taken from the **invocation reward** (`amount` ignored).
-- **Asset currency**: the contract **pulls `amount`** of the asset from the caller (`transferShareOwnershipAndPossession(..., caller, caller, amount, SELF)`), so the caller must first have **granted QREWARDS management** of those shares (via `QX.TransferShareManagementRights` to this contract's index), or already hold them under QREWARDS management.
-
-### How outside / future contracts feed a pool
-
-A contract pays a pool by invoking `depositDividend` as a cross-contract call:
-
-```cpp
-QREWARDS::depositDividend_input in; in.poolId = POOL; in.currencyIndex = 0; in.amount = 0;
-QREWARDS::depositDividend_output out;
-INVOKE_OTHER_CONTRACT_PROCEDURE(QREWARDS, depositDividend, in, out, quAmount); // QU via invocationReward
-```
-
-**Critical constraint:** Qubic only allows a contract to call another contract **with a lower index**. QREWARDS is index 29, so **only contracts deployed later (index > 29) can call `depositDividend`**. That's fine for *future* contracts (deploy QREWARDS before them). Existing lower-index contracts, and plain user/EOA transactions, feed a pool by having a **user or an off-chain keeper** call `depositDividend` directly (users can call any contract). For asset currencies the caller grants management first (above).
-
-### Tagged QU transfers (no procedure call, works for any index)
-
-A raw QU transfer carries no memo, so tagging is done by a **sender→pool route**. A funder calls `setFundingRoute(poolId, clear=false)` **once**; afterwards any plain QU it sends to the contract is auto-credited to that pool's QU currency (slot 0) by `POST_INCOMING_TRANSFER`. This works for wallets/keepers (`standardTransaction`) **and for any contract via `qpi.transfer`** (`qpiTransfer`) — including **lower-index** contracts that can't `INVOKE_OTHER_CONTRACT_PROCEDURE`. Transfers from senders with no route are left unattributed (effectively donated). `POST_INCOMING_TRANSFER` deliberately ignores `procedureTransaction`/`procedureInvocationByOtherContract` so `depositDividend` is never double-counted. One route per sender; use a dedicated sending address/contract per pool, or `depositDividend` for multi-pool funding.
-
-`syncProfit(poolId, user)` is the heart: settle pending at old balance → recompute entitlement → adjust `poolMeta.totalDistributed` → write/remove the position. Idempotent (SET, not ADD).
+For the whole contract, once per epoch:
+1. **Operating fee:** draw `operatingFee` from each active pool's `operatingBalance`. Underfunded
+   → pause (and deactivate after `MAX_MISSED_EPOCHS`). Collected fees → `DistributeFee` (70/15/15).
+2. **Dividend-fee flush:** `pendingDivFeeQU` → `DistributeDivFee` (20% shareholders via
+   `distributeDividends`, 80% + rounding to `qpayhubAddress`, burned if unset).
+3. **Distribution:** for each pool, `DistributePool`:
+   - **Pass 1** — walk each active registered asset's possessors (`AssetPossessionIterator`),
+     read live `numberOfPossessedShares`, skip `SELF` and excluded addresses, add the per-asset
+     weight into the `snapshot` map and into `totalWeight`.
+   - **Pass 2** — for each currency with `pot > 0`, iterate the snapshot and pay each holder
+     `pot × weight / totalWeight` (128-bit multiply to avoid overflow); carry the undistributed
+     remainder in `pot`. `lastTotalWeight` is recorded for front ends.
+   - If `totalWeight == 0` (no eligible holders) the pots carry to a future epoch.
 
 ---
 
-## 6. Capacity / state size
+## 6. Fees
 
-| Component | Size |
-|---|---|
-| Position map (2²² × `{id + {profit, debt[4]}}`) | ~385–404 MB (depends on `id` alignment) |
-| Registry (1024×64 `AssetRule`) | ~4–6 MB |
-| Pool metadata (1024 `PoolMeta`) | ~0.1 MB |
-| **Total** | **~400–411 MB** (cap is 1 GB) |
+**Create / operating fee** (`DistributeFee`): 70% QREWARDS shareholders (`distributeDividends`),
+15% `qpayhubAddress`, 15% burn (its 15% burns too if no QPAYHUB address is set).
 
-"Positions" = `(pool, wallet)` memberships, not people. One wallet in 3 pools = 3 positions. A wallet that drops to zero holdings has its position reclaimed on the next `syncProfit`, freeing the slot.
+**Dividend fee** — 5% of every deposit, always 80/20 (20% → QREWARDS shareholders), but the
+80% destination differs by currency:
+- **QU dividend → 80% to the QPAYHUB dividends account (`qpayhubAddress`).** The whole fee
+  accrues to `pendingDivFeeQU` and is flushed at `END_EPOCH`: 20% via `distributeDividends`,
+  80% (+ rounding) via a bare `qpi.transfer` that QPAYHUB's `POST_INCOMING_TRANSFER`
+  auto-credits into its `feePool`. Burned if `qpayhubAddress` is unset.
+- **Token dividend → 80% to the QPAY wallet (`qpayTokenDividendsAddress`).** Settled inline at
+  deposit: 20% to shareholders paid **in the token itself** by iterating the contract share
+  asset (`"QREWARD"` packed = `19230739006837329`, issuer `NULL_ID`) via
+  `DistributeTokenToShareholders`; the rest (80% + dust + any failed shareholder sends) → the
+  QPAY wallet. No QPAY wallet set → no fee is taken on tokens.
 
----
+Why two destinations: QPAYHUB's `feePool` only accepts **plain QU** (its `POST_INCOMING_TRANSFER`
+ignores incoming assets), so token fees can't be credited there and go to the QPAY wallet instead.
 
-## 7. Gotchas & security
-
-1. **Settle-before-balance-change** ordering (§4) — non-negotiable.
-2. **Zero the KeyProto before K12** — else padding makes keys nondeterministic (fixed in the file).
-3. **Multiplier must stay non-decreasing** — the split-proofness invariant.
-4. **No O(N) hot paths** — accumulator avoids per-pool payout loops; the only loop is ≤64 registry entries in `computeEntitlement`.
-5. **Pool admins are third parties** — each is isolated to its own pool; a pool admin can't touch other pools or the platform.
-6. **Platform owner is minimal** — sets the creation fee only; no dividend cut; claim-if-NULL at deploy.
-7. **`unit` must be sane** — keep `supply/unit` within safe range so `basePoints × mult × weightBps` can't overflow.
-8. **`profit*acc` long-run overflow** — documented; checkpoint if a pool runs enormous lifetime revenue.
-9. **Asset must be issued** before `registerAsset` (`isAssetIssued`).
+The per-share flooring in the token shareholder leg means it only pays out once `20% of the fee
+≥ NUMBER_OF_COMPUTORS (676)`; below that it rounds to 0 and the whole fee folds to the QPAY wallet.
 
 ---
 
-## 8. Deployment
+## 7. Procedures & functions
 
-1. Register in `contract_core/contract_def.h` (done: index 29, construction epoch 230 = placeholder — set the real one).
-2. After construction, the deployer calls `setPlatformOwner` once to claim platform ownership, and `setPlatformParams` to set the creation fee.
-3. Anyone then calls `createPool`, `registerAsset`s their ecosystem assets (units/weights per §3), and points their contracts' fee share at `depositDividend(poolId)`.
+**Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)`
+· `setPoolAdmin(5)` · `depositDividend(6)` · `depositOperating(7)` · `setPlatformParams(8)` (owner)
+· `setPlatformOwner(9)` (first caller claims it from NULL) · `TransferShareManagementRights(10)`
+· `registerAssets(11)` (batch, ≤16) · `addDividendCurrency(12)` · `setFundingRoute(13)`
+· `setQpayhubAddress(14)` (owner) · `setExcludedAddress(15)` (pool admin) ·
+`setQpayTokenDividendsAddress(16)` (owner).
+
+**Functions** (index): `getPool(1)` (admin, label, operatingBalance, `lastTotalWeight`, counts,
+active/paused, and per-currency `assetName`/`pot`/`lifetime`) · `getPoolAsset(2)` ·
+`getAllPoolAssets(3)` · `getPlatform(4)` · `getFundingRoute(5)` · `getPoolsByAdmin(6)` (paginated,
+256/page) · `isExcluded(7)` · `previewWeight(8)`.
+
+> **Breaking change vs. the old accumulator model:** `claimDividends`, `syncProfit`,
+> `getPosition`, `getPositions`, and `previewProfit` are **removed**; `createPool` no longer takes
+> a token `supply`. Front ends read `previewWeight` + `getPool().lastTotalWeight`/`currencyPot`
+> instead of positions, and holders are paid automatically (no claim).
 
 ---
 
-## 9. Legal note
+## 8. Funding a pool from outside
 
-Opening this to third parties makes it a **platform that facilitates others issuing
-dividend-bearing tokens** — i.e., helping third parties run what are very likely
-**unregistered securities**, plus running a fee-collecting redistributor. That is a
-materially larger regulatory surface than personal use (issuer/exchange/transfer-agent,
-money-transmission, platform-operator liability). Get securities counsel before opening
-it publicly. (Analysis, not legal advice.)
+- **Direct:** `depositDividend(poolId, currencyIndex, amount)` — QU from the invocation reward,
+  or `amount` of a token pulled from the caller (the caller must grant QREWARDS management of the
+  token first, e.g. QX `TransferShareManagementRights`).
+- **Tagged QU transfer:** `setFundingRoute(poolId)` maps the caller's address → a pool; thereafter
+  a **plain QU transfer** from that address to the contract is auto-credited to the pool's QU pot
+  by `POST_INCOMING_TRANSFER` (standard/qpi transfers only — procedure transfers are handled by
+  `depositDividend`, so they are skipped to avoid double counting). This lets even lower-index
+  contracts fund a pool with no cross-contract procedure call.
+
+**How fees reach QPAYHUB:** QPAYHUB (qubic/core PR #1015, `src/contracts/QPayhub.h`, CONTRACT_INDEX
+29) has no deposit procedure — its `POST_INCOMING_TRANSFER` auto-credits plain QU into its `feePool`.
+So `qpi.transfer(qpayhubAddress, …)` from QREWARDS is all that's needed; set
+`qpayhubAddress = id(29,0,0,0)`.
+
+---
+
+## 9. Index & deployment
+
+QPAYHUB occupies **CONTRACT_INDEX 29**, index 30 is another already-deployed contract, so **QREWARDS
+is wired at index 31**. Indices 29/30 are empty placeholder contracts (`QRewardsReserved29.h` /
+`QRewardsReserved30.h`) purely to keep the positional contract array consistent. The contract share
+asset ticker is `"QREWARD"` (≤7 chars).
+
+---
+
+## 10. Testing notes
+
+Unit tests live in `test/contract_qrewards.cpp`. The authoritative test build is **MSVC on Windows**
+(`.github/workflows/build-tests.yml`); the platform layer uses MSVC intrinsics, so a Linux clang/gcc
+build of the full test target is not supported — **rely on CI for compile-verification.** The tests
+cover: weight computation, QU/token distribution at epoch end, the **sell-then-rebuy no-double-count**
+case, pro-rata splits, excluded addresses, the QU and token dividend-fee splits, operating-fee pausing
+(which stops distribution), funding routes, and admin/owner gating.

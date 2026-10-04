@@ -2,39 +2,55 @@ using namespace QPI;
 
 // QREWARDS (multi-pool) - open ecosystem loyalty & dividend platform.
 //
-// Anyone can createPool(): each pool has its own creator/admin, its own internal
-// SOULBOUND reward token (internal accounting, not transferable), and its own
-// asset registry. Holders of a pool's registered assets earn that pool's token.
+// Anyone can createPool(): each pool has its own creator/admin and its own asset
+// registry. Holding a pool's registered assets earns a weighted "share" of that
+// pool's dividends.
+//
+// DISTRIBUTION MODEL (pure snapshot, qRWA-style):
+//   Dividends are NOT tracked as a persistent soulbound balance. Instead, each
+//   deposit (minus the 5% fee) accumulates into a per-currency POT for the pool.
+//   At END_EPOCH the contract reads LIVE holdings straight from the asset ledger,
+//   computes each holder's weight (per-asset points x concentration multiplier x
+//   price weight, exactly like previewWeight), and pays out the pot pro-rata by
+//   weight. Because every epoch reads the real ledger, a holder who sold cannot be
+//   paid (their live balance is 0) and the same tokens can never be counted twice
+//   -- there are no stale "ghost" positions. This is why there is no claim/sync
+//   step and no persistent per-user balance.
 //
 // Each pool can pay dividends in up to QREWARDS_MAX_DIV_CURRENCIES currencies
 // (slot 0 = QU by default; pool admin can add asset currencies, e.g. QDOGE).
-// Outside contracts (or anyone) feed a currency into a specific pool via
-// depositDividend(poolId, currencyIndex, amount); it is paid pro-rata to that
-// pool's DISTRIBUTED balances only. Pools are fully isolated: a pool can only
-// ever pay out what was deposited to it.
+// Pools are fully isolated: a pool can only ever pay out what was deposited to it.
+//
+// NOTE ON SCALE: END_EPOCH distribution iterates each active pool's registered
+// assets' holders. It is designed for a handful of active pools of up to a few
+// thousand holders each (QREWARDS_SNAPSHOT_CAP). It is NOT a mass multi-tenant
+// sweep of thousands of busy pools in one epoch.
+//
+// NOTE ON TIMING: distribution uses the END_EPOCH snapshot only. That fully
+// prevents stale/ghost over-payment, but does not by itself stop someone buying
+// a large position right before the epoch boundary to grab that epoch's dividend
+// (and selling after). A min(begin,end) rule would require a BEGIN_EPOCH snapshot;
+// see docs/qrewards-build-guide.md.
 //
 // See docs/qrewards-build-guide.md for the full design rationale.
 
 constexpr uint32 QREWARDS_MAX_POOLS            = 1024;
-constexpr uint64 QREWARDS_POSITION_CAPACITY    = 4194304ULL; // 2^22 (poolId,wallet) positions
 constexpr uint32 QREWARDS_MAX_ASSETS_PER_POOL  = 64;
 constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES   = 4;          // QU + up to 3 assets per pool
 constexpr uint32 QREWARDS_MAX_BATCH            = 16;         // assets per registerAssets call
 constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool routing entries for tagged QU transfers
 constexpr uint32 QREWARDS_PAGE                 = 256;        // page size for paginated views
-constexpr uint32 QREWARDS_MAX_QUERY            = 64;         // pools per getPositions batch
+constexpr uint64 QREWARDS_SNAPSHOT_CAP         = 16384;      // 2^14: max unique holders per pool in one epoch snapshot
 constexpr uint64 QREWARDS_REGISTRY_SIZE        = (uint64)QREWARDS_MAX_POOLS * QREWARDS_MAX_ASSETS_PER_POOL;
-constexpr uint64 QREWARDS_ACC_SCALE            = 1000000ULL;
 constexpr uint64 QREWARDS_BPS                  = 10000;
 constexpr uint32 QREWARDS_MAX_WEIGHT_BPS       = 1000000;        // cap weight at 100x
-constexpr uint64 QREWARDS_DEFAULT_SUPPLY       = 1000000000ULL;  // informational per-pool token supply
 constexpr uint64 QREWARDS_DEFAULT_CREATE_FEE   = 5000000ULL;     // 5M QU to create a pool; protocol-owner tunable
 constexpr uint64 QREWARDS_DEFAULT_OPERATING_FEE = 100000ULL;     // 100k QU/epoch per pool; protocol-owner tunable
-constexpr uint64 QREWARDS_FEE_SHAREHOLDER_PCT  = 70;             // fee split: 70% QREWARDS shareholders
+constexpr uint64 QREWARDS_FEE_SHAREHOLDER_PCT  = 70;             // create/operating fee split: 70% QREWARDS shareholders
 constexpr uint64 QREWARDS_FEE_QPAYHUB_PCT      = 15;             // 15% QPAYHUB dividends address (rest burned)
 constexpr uint32 QREWARDS_MAX_MISSED_EPOCHS    = 2;              // paused this many epochs, then deactivated
 constexpr uint64 QREWARDS_DIVIDEND_FEE_PCT     = 5;              // 5% fee skimmed from every dividend deposit
-constexpr uint64 QREWARDS_DIVFEE_QPAYHUB_PCT   = 80;            // of the 5% fee: 80% QPAYHUB
+constexpr uint64 QREWARDS_DIVFEE_QPAYHUB_PCT   = 80;            // of the 5% fee: 80% QPAYHUB (QU) / QPAY wallet (token)
 constexpr uint64 QREWARDS_DIVFEE_SHAREHOLDER_PCT = 20;          // of the 5% fee: 20% QREWARDS shareholders
 constexpr uint64 QREWARDS_MAX_EXCLUSIONS       = 65536;         // (poolId,address) exclusions, shared
 constexpr uint64 QREWARDS_CONTRACT_ASSET_NAME  = 19230739006837329ULL; // packed "QREWARD" (contract shares, issuer NULL_ID)
@@ -58,7 +74,7 @@ constexpr sint32 QREWARDS_POOL_PAUSED        = 13;
 // log types
 constexpr uint32 QREWARDS_LOG_SUCCESS       = 0;
 constexpr uint32 QREWARDS_LOG_POOL_CREATED  = 1;
-constexpr uint32 QREWARDS_LOG_SYNC          = 2;
+constexpr uint32 QREWARDS_LOG_DISTRIBUTED   = 2;
 constexpr uint32 QREWARDS_LOG_DIVIDEND      = 3;
 constexpr uint32 QREWARDS_LOG_ASSET_CHANGED = 4;
 
@@ -76,7 +92,7 @@ public:
         sint8 _terminator;
     };
 
-    // A qualifying asset in a pool: holding it earns the pool's reward token.
+    // A qualifying asset in a pool: holding it earns a weighted share of the pool.
     struct AssetRule
     {
         uint64 assetName;
@@ -98,62 +114,45 @@ public:
     };
 
     // A dividend currency for a pool. assetName==0 && issuer==NULL_ID means QU.
+    // `pot` is the accumulated-but-undistributed revenue (carried across epochs
+    // if there were no eligible holders, plus per-epoch rounding dust).
     struct DivCurrency
     {
         uint64 assetName;
         id     issuer;
-        uint64 acc;            // accRewardPerTokenScaled for this currency
-        uint64 accRemainder;   // carried division remainder (no dust lost)
-        uint64 pendingRevenue; // received while totalDistributed == 0
-        uint64 lifetime;       // stat
+        uint64 pot;       // undistributed revenue, paid out at END_EPOCH
+        uint64 lifetime;  // cumulative revenue ever deposited (stat)
         uint8  active;
     };
 
-    // Per-pool scalars (kept modest so sync/claim read-modify-write stays cheap).
     struct PoolMeta
     {
         id     admin;
-        uint64 supply;            // informational pool-token supply
-        uint64 totalDistributed;  // undistributed = supply - totalDistributed
         uint64 label;             // short packed name (optional)
         uint64 operatingBalance;  // QU reserve for the per-epoch operating fee
+        uint64 lastTotalWeight;   // total holder weight at the last END_EPOCH distribution (for front ends)
         uint32 numAssets;
         uint32 missedEpochs;      // consecutive epochs the operating fee could not be paid
         uint8  numCurrencies;
         uint8  active;            // 1 = pool exists (0 after deactivation)
-        uint8  paused;            // 1 = underfunded, not accruing
+        uint8  paused;            // 1 = underfunded, not accruing/distributing
         Array<DivCurrency, QREWARDS_MAX_DIV_CURRENCIES> currencies;
     };
 
-    // Combined soulbound position: reward balance + per-currency reward debt.
-    struct Position
-    {
-        uint64 profit;
-        Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> debt;
-    };
-
+    // Composite key helper (excluded set).
     struct KeyProto
     {
         uint64 poolId;
         id     wallet;
     };
 
-    // One row of a batch getPositions response.
-    struct PositionEntry
-    {
-        uint64 poolId;
-        uint64 profit;
-        Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> pending;
-        uint8  numCurrencies;
-        uint8  valid; // 1 if the pool exists
-    };
-
     struct StateData
     {
-        HashMap<id, Position, QREWARDS_POSITION_CAPACITY> positions; // key = K12(poolId, wallet)
         // Excluded (poolId,address): key = K12(poolId, address) -> 1. Excluded holders
-        // earn nothing (their entitlement is forced to 0), so they neither receive nor dilute.
+        // earn nothing (weight forced to 0), so they neither receive nor dilute.
         HashMap<id, uint8, QREWARDS_MAX_EXCLUSIONS> excluded;
+        // Scratch holder->weight map, rebuilt per pool during END_EPOCH distribution.
+        HashMap<id, uint64, QREWARDS_SNAPSHOT_CAP> snapshot;
         uint64 pendingDivFeeQU; // QU dividend-fee skim, flushed 80/20 at END_EPOCH
         Array<PoolMeta, QREWARDS_MAX_POOLS> poolMeta;
         Array<AssetRule, QREWARDS_REGISTRY_SIZE> registry;           // pool p asset i at p*MAX_ASSETS+i
@@ -161,12 +160,14 @@ public:
         HashMap<id, uint64, QREWARDS_MAX_FUNDERS> fundingRoute;
         uint32 numPools;
         id platformOwner;
-        // Receives the 15% QPAYHUB share of CREATE/OPERATING fees. QPAYHUB
-        // (qubic/core PR #1015) is CONTRACT_INDEX 29, so set this to id(29, 0, 0, 0):
-        // a plain qpi.transfer there is auto-credited to QPAYHUB's feePool.
+        // Receives the 15% QPAYHUB share of CREATE/OPERATING fees AND the 80% QPAYHUB
+        // share of the 5% QU DIVIDEND fee. QPAYHUB (qubic/core PR #1015) is
+        // CONTRACT_INDEX 29, so set this to id(29, 0, 0, 0): a plain qpi.transfer there
+        // is auto-credited to QPAYHUB's feePool.
         id qpayhubAddress;
-        // Receives the QPAY share (80%) of the 5% DIVIDEND fee, in both QU and tokens.
-        // Initialized to the QPAY token dividends wallet; protocol-owner tunable.
+        // Receives the QPAY share (80%) of the 5% TOKEN dividend fee (QPAYHUB's feePool
+        // is QU-only, so token fees go here instead). Initialized to the QPAY token
+        // dividends wallet; protocol-owner tunable.
         id qpayTokenDividendsAddress;
         uint64 createPoolFee;
         uint64 operatingFee;   // per-pool per-epoch
@@ -185,8 +186,11 @@ protected:
         return 0;
     }
 
+    // Live weight of one user in one pool: sum over the pool's active registered
+    // assets of (held/unit) x concentrationMultiplier x weightBps / BPS^2.
+    // Excluded (poolId,user) earns 0. Reads holdings straight from the ledger.
     struct ComputeEntitlement_input { uint64 poolId; id user; };
-    struct ComputeEntitlement_output { uint64 profit; };
+    struct ComputeEntitlement_output { uint64 weight; };
     struct ComputeEntitlement_locals
     {
         PoolMeta meta;
@@ -204,8 +208,7 @@ protected:
     };
     PRIVATE_FUNCTION_WITH_LOCALS(ComputeEntitlement)
     {
-        output.profit = 0;
-        // Excluded (poolId,user) earns nothing.
+        output.weight = 0;
         setMemory(locals.proto, 0);
         locals.proto.poolId = input.poolId;
         locals.proto.wallet = input.user;
@@ -232,35 +235,12 @@ protected:
             locals.mult = concentrationMultiplier(locals.pts);
             locals.add = div(locals.pts * locals.mult * (uint64)locals.rule.weightBps,
                              QREWARDS_BPS * QREWARDS_BPS);
-            output.profit += locals.add;
+            output.weight += locals.add;
         }
     }
 
-    // Pay `amount` of a currency (QU or asset) to `to`.
-    struct PayCurrency_input { uint64 assetName; id issuer; id to; uint64 amount; };
-    struct PayCurrency_output { bit ok; };
-    struct PayCurrency_locals { };
-    PRIVATE_PROCEDURE_WITH_LOCALS(PayCurrency)
-    {
-        output.ok = 0;
-        if (input.amount == 0) { output.ok = 1; return; }
-        if (input.assetName == 0 && input.issuer == NULL_ID)
-        {
-            qpi.transfer(input.to, (sint64)input.amount);
-            output.ok = 1;
-        }
-        else
-        {
-            if (qpi.transferShareOwnershipAndPossession(input.assetName, input.issuer, SELF, SELF,
-                    (sint64)input.amount, input.to) >= 0)
-            {
-                output.ok = 1;
-            }
-        }
-    }
-
-    // Split a QU fee: 70% to QREWARDS shareholders, 15% to the QPAYHUB address, 15% burned.
-    // (If no QPAYHUB address is set, its share is burned too.) Remainder/rounding -> burn.
+    // Split a QU fee (create/operating): 70% to QREWARDS shareholders, 15% to the
+    // QPAYHUB address, 15% burned. (No QPAYHUB address -> its share is burned too.)
     struct DistributeFee_input { uint64 amount; };
     struct DistributeFee_output { };
     struct DistributeFee_locals { uint64 shTotal; uint64 qpayhub; uint64 perShare; uint64 actualSh; uint64 burnAmt; };
@@ -294,9 +274,7 @@ protected:
     }
 
     // Split a QU dividend fee: 20% to QREWARDS shareholders, 80% (+ rounding) to the
-    // QPAYHUB dividends account. QPAYHUB's POST_INCOMING_TRANSFER auto-credits plain QU
-    // into its feePool, so a bare qpi.transfer is all that's needed. If no QPAYHUB
-    // address is set, that 80% is burned instead.
+    // QPAYHUB dividends account (auto-credited QU transfer). Burned if unset.
     struct DistributeDivFee_input { uint64 amount; };
     struct DistributeDivFee_output { };
     struct DistributeDivFee_locals { uint64 shTotal; uint64 perShare; uint64 actualSh; uint64 toQpayhub; };
@@ -310,8 +288,6 @@ protected:
         {
             qpi.distributeDividends((sint64)locals.perShare);
         }
-        // Everything not distributed to shareholders (the 80% + rounding) goes to the
-        // QPAYHUB dividends account (its feePool, via auto-credited QU transfer).
         locals.toQpayhub = input.amount - locals.actualSh;
         if (locals.toQpayhub > 0)
         {
@@ -327,10 +303,10 @@ protected:
     }
 
     // Distribute an asset (token) held by SELF pro-rata to QREWARDS shareholders.
-    // distributeDividends() only works for QU, so for the 20% shareholder leg of a
-    // *token* dividend fee we iterate the contract share asset and transfer per-share.
-    // `distributed` is the amount actually sent out (<= amount; the rounding dust and
-    // any failed transfers stay with SELF and are folded back by the caller to QPAY).
+    // distributeDividends() is QU-only, so for the 20% shareholder leg of a *token*
+    // dividend fee we iterate the contract share asset and transfer per-share.
+    // `distributed` is the amount actually sent out (<= amount; dust/failed transfers
+    // stay with SELF and are folded back by the caller to the QPAY wallet).
     struct DistributeTokenToShareholders_input { uint64 assetName; id issuer; uint64 amount; };
     struct DistributeTokenToShareholders_output { uint64 distributed; };
     struct DistributeTokenToShareholders_locals { Asset shareAsset; AssetPossessionIterator iter; uint64 perShare; sint64 held; uint64 send; };
@@ -359,12 +335,140 @@ protected:
         }
     }
 
+    // Distribute one pool's currency pots to its holders by live weighted holdings.
+    // Pass 1 builds the holder->weight snapshot from the live asset ledger; pass 2
+    // pays each holder (pot * weight / totalWeight), carrying rounding dust in `pot`.
+    struct DistributePool_input { uint64 poolId; };
+    struct DistributePool_output { };
+    struct DistributePool_locals
+    {
+        PoolMeta meta;
+        uint64 base;
+        uint32 i;
+        AssetRule rule;
+        Asset asset;
+        AssetPossessionIterator iter;
+        id holder;
+        sint64 held;
+        KeyProto proto;
+        id exKey;
+        uint8 exFlag;
+        uint64 pts;
+        uint64 mult;
+        uint64 add;
+        uint64 existing;
+        uint64 totalWeight;
+        uint32 k;
+        DivCurrency cur;
+        sint64 idx;
+        uint64 weight;
+        uint64 payout;
+        uint64 distributed;
+        uint128 prod;
+        uint128 pay128;
+    };
+    PRIVATE_PROCEDURE_WITH_LOCALS(DistributePool)
+    {
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (!locals.meta.active || locals.meta.paused || locals.meta.numAssets == 0) return;
+
+        // Pass 1: build live holder -> weight snapshot.
+        state.mut().snapshot.reset();
+        locals.totalWeight = 0;
+        locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
+        for (locals.i = 0; locals.i < locals.meta.numAssets; locals.i++)
+        {
+            locals.rule = state.get().registry.get(locals.base + locals.i);
+            if (!locals.rule.active || locals.rule.unit == 0) continue;
+            locals.asset.assetName = locals.rule.assetName;
+            locals.asset.issuer = locals.rule.issuer;
+            locals.iter.begin(locals.asset);
+            while (!locals.iter.reachedEnd())
+            {
+                locals.held = locals.iter.numberOfPossessedShares();
+                locals.holder = locals.iter.possessor();
+                if (locals.held > 0 && locals.holder != SELF)
+                {
+                    setMemory(locals.proto, 0);
+                    locals.proto.poolId = input.poolId;
+                    locals.proto.wallet = locals.holder;
+                    locals.exKey = qpi.K12(locals.proto);
+                    locals.exFlag = 0;
+                    if (!(state.get().excluded.get(locals.exKey, locals.exFlag) && locals.exFlag))
+                    {
+                        locals.pts = div((uint64)locals.held, locals.rule.unit);
+                        if (locals.pts > 0)
+                        {
+                            locals.mult = concentrationMultiplier(locals.pts);
+                            locals.add = div(locals.pts * locals.mult * (uint64)locals.rule.weightBps,
+                                             QREWARDS_BPS * QREWARDS_BPS);
+                            if (locals.add > 0)
+                            {
+                                locals.existing = 0;
+                                state.get().snapshot.get(locals.holder, locals.existing);
+                                // Only count the weight if it is actually stored (an existing key
+                                // updates in place; a new key is dropped iff the map is full).
+                                if (state.mut().snapshot.set(locals.holder, locals.existing + locals.add) != NULL_INDEX)
+                                {
+                                    locals.totalWeight += locals.add;
+                                }
+                            }
+                        }
+                    }
+                }
+                locals.iter.next();
+            }
+        }
+
+        locals.meta.lastTotalWeight = locals.totalWeight;
+        if (locals.totalWeight == 0)
+        {
+            // No eligible holders: pots carry to a future epoch.
+            state.mut().poolMeta.set(input.poolId, locals.meta);
+            return;
+        }
+
+        // Pass 2: pay each currency's pot pro-rata by weight.
+        for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+        {
+            locals.cur = locals.meta.currencies.get(locals.k);
+            if (locals.cur.pot == 0) continue;
+            locals.distributed = 0;
+            for (locals.idx = state.get().snapshot.nextElementIndex(NULL_INDEX);
+                 locals.idx != NULL_INDEX;
+                 locals.idx = state.get().snapshot.nextElementIndex(locals.idx))
+            {
+                locals.holder = state.get().snapshot.key(locals.idx);
+                locals.weight = state.get().snapshot.value(locals.idx);
+                if (locals.weight == 0) continue;
+                locals.prod = (uint128)locals.cur.pot * (uint128)locals.weight;
+                locals.pay128 = div<uint128>(locals.prod, (uint128)locals.totalWeight);
+                locals.payout = locals.pay128.low; // <= pot, fits uint64
+                if (locals.payout == 0) continue;
+                if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
+                {
+                    if (qpi.transfer(locals.holder, (sint64)locals.payout) >= 0)
+                        locals.distributed += locals.payout;
+                }
+                else
+                {
+                    if (qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
+                            SELF, SELF, (sint64)locals.payout, locals.holder) >= 0)
+                        locals.distributed += locals.payout;
+                }
+            }
+            locals.cur.pot -= locals.distributed; // carry rounding dust to next epoch
+            locals.meta.currencies.set(locals.k, locals.cur);
+        }
+        state.mut().poolMeta.set(input.poolId, locals.meta);
+    }
+
 public:
     /**************************************/
     /********PROCEDURES (state-changing)***/
     /**************************************/
 
-    struct createPool_input { uint64 supply; uint64 label; };
+    struct createPool_input { uint64 label; };
     struct createPool_output { sint32 returnCode; uint64 poolId; };
     struct createPool_locals { PoolMeta meta; DivCurrency qu; DistributeFee_input dfi; DistributeFee_output dfo; QRewardsLogger log; };
     PUBLIC_PROCEDURE_WITH_LOCALS(createPool)
@@ -387,7 +491,6 @@ public:
 
         setMemory(locals.meta, 0);
         locals.meta.admin = qpi.invocator();
-        locals.meta.supply = (input.supply == 0) ? QREWARDS_DEFAULT_SUPPLY : input.supply;
         locals.meta.label = input.label;
         locals.meta.operatingBalance = (uint64)qpi.invocationReward() - state.get().createPoolFee;
         locals.meta.active = 1;
@@ -554,8 +657,7 @@ public:
     }
 
     // Exclude (or re-include) an address in a pool. Excluded addresses earn nothing
-    // (entitlement forced to 0), so they neither receive dividends nor dilute others.
-    // A newly-excluded address with an existing position is zeroed on its next syncProfit.
+    // (weight forced to 0), so they neither receive dividends nor dilute others.
     struct setExcludedAddress_input { uint64 poolId; id address; bit excluded; };
     struct setExcludedAddress_output { sint32 returnCode; };
     struct setExcludedAddress_locals { PoolMeta meta; KeyProto proto; id key; };
@@ -574,156 +676,8 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    struct syncProfit_input { uint64 poolId; id user; };
-    struct syncProfit_output { sint32 returnCode; uint64 profit; };
-    struct syncProfit_locals
-    {
-        PoolMeta meta;
-        KeyProto proto;
-        id key;
-        Position pos;
-        DivCurrency cur;
-        PayCurrency_input pci;
-        PayCurrency_output pco;
-        uint32 k;
-        uint64 oldBal;
-        uint64 newBal;
-        uint64 pt;
-        uint64 owed;
-        ComputeEntitlement_input cei;
-        ComputeEntitlement_output ceo;
-        QRewardsLogger log;
-    };
-    // Permissionless: anyone may (re)sync any (pool,user). Idempotent (SET, not ADD).
-    PUBLIC_PROCEDURE_WITH_LOCALS(syncProfit)
-    {
-        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
-        locals.meta = state.get().poolMeta.get(input.poolId);
-        if (!locals.meta.active) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
-        if (locals.meta.paused) { output.returnCode = QREWARDS_POOL_PAUSED; return; }
-
-        setMemory(locals.proto, 0);
-        locals.proto.poolId = input.poolId;
-        locals.proto.wallet = input.user;
-        locals.key = qpi.K12(locals.proto);
-
-        setMemory(locals.pos, 0);
-        state.get().positions.get(locals.key, locals.pos);
-        locals.oldBal = locals.pos.profit;
-
-        // 1) settle pending dividends for EVERY currency at the OLD balance.
-        // Pay token currencies before QU (highest slot first; slot 0 = QU is last).
-        for (locals.k = locals.meta.numCurrencies; locals.k-- > 0; )
-        {
-            locals.cur = locals.meta.currencies.get(locals.k);
-            locals.pt = div(locals.oldBal * locals.cur.acc, QREWARDS_ACC_SCALE);
-            if (locals.pt > locals.pos.debt.get(locals.k))
-            {
-                locals.owed = locals.pt - locals.pos.debt.get(locals.k);
-                if (locals.owed > 0)
-                {
-                    locals.pci.assetName = locals.cur.assetName;
-                    locals.pci.issuer = locals.cur.issuer;
-                    locals.pci.to = input.user;
-                    locals.pci.amount = locals.owed;
-                    CALL(PayCurrency, locals.pci, locals.pco);
-                }
-            }
-        }
-
-        // 2) recompute entitlement from live holdings.
-        locals.cei.poolId = input.poolId;
-        locals.cei.user = input.user;
-        CALL(ComputeEntitlement, locals.cei, locals.ceo);
-        locals.newBal = locals.ceo.profit;
-
-        // 3) adjust pool total.
-        if (locals.newBal >= locals.oldBal) locals.meta.totalDistributed += (locals.newBal - locals.oldBal);
-        else locals.meta.totalDistributed -= (locals.oldBal - locals.newBal);
-        state.mut().poolMeta.set(input.poolId, locals.meta);
-
-        // 4) store position with fresh per-currency debts (or remove if zero).
-        if (locals.newBal > 0)
-        {
-            locals.pos.profit = locals.newBal;
-            for (locals.k = 0; locals.k < QREWARDS_MAX_DIV_CURRENCIES; locals.k++)
-            {
-                locals.cur = locals.meta.currencies.get(locals.k);
-                locals.pos.debt.set(locals.k, div(locals.newBal * locals.cur.acc, QREWARDS_ACC_SCALE));
-            }
-            state.mut().positions.set(locals.key, locals.pos);
-        }
-        else
-        {
-            state.mut().positions.removeByKey(locals.key);
-        }
-
-        output.profit = locals.newBal;
-        output.returnCode = QREWARDS_SUCCESS;
-        locals.log = QRewardsLogger{ CONTRACT_INDEX, QREWARDS_LOG_SYNC, 0 };
-        LOG_INFO(locals.log);
-    }
-
-    struct claimDividends_input { uint64 poolId; };
-    struct claimDividends_output { sint32 returnCode; uint32 currenciesPaid; };
-    struct claimDividends_locals
-    {
-        PoolMeta meta;
-        KeyProto proto;
-        id key;
-        Position pos;
-        DivCurrency cur;
-        PayCurrency_input pci;
-        PayCurrency_output pco;
-        uint32 k;
-        uint64 pt;
-        uint64 owed;
-    };
-    // Settle pending dividends to the caller for ALL of a pool's currencies.
-    PUBLIC_PROCEDURE_WITH_LOCALS(claimDividends)
-    {
-        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-        output.currenciesPaid = 0;
-        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
-        locals.meta = state.get().poolMeta.get(input.poolId);
-
-        setMemory(locals.proto, 0);
-        locals.proto.poolId = input.poolId;
-        locals.proto.wallet = qpi.invocator();
-        locals.key = qpi.K12(locals.proto);
-
-        setMemory(locals.pos, 0);
-        if (!state.get().positions.get(locals.key, locals.pos) || locals.pos.profit == 0)
-        {
-            output.returnCode = QREWARDS_SUCCESS;
-            return;
-        }
-        // Pay token currencies before QU (highest slot first; slot 0 = QU is last).
-        for (locals.k = locals.meta.numCurrencies; locals.k-- > 0; )
-        {
-            locals.cur = locals.meta.currencies.get(locals.k);
-            locals.pt = div(locals.pos.profit * locals.cur.acc, QREWARDS_ACC_SCALE);
-            if (locals.pt > locals.pos.debt.get(locals.k))
-            {
-                locals.owed = locals.pt - locals.pos.debt.get(locals.k);
-                if (locals.owed > 0)
-                {
-                    locals.pci.assetName = locals.cur.assetName;
-                    locals.pci.issuer = locals.cur.issuer;
-                    locals.pci.to = qpi.invocator();
-                    locals.pci.amount = locals.owed;
-                    CALL(PayCurrency, locals.pci, locals.pco);
-                    if (locals.pco.ok) output.currenciesPaid++;
-                }
-            }
-            locals.pos.debt.set(locals.k, locals.pt);
-        }
-        state.mut().positions.set(locals.key, locals.pos);
-        output.returnCode = QREWARDS_SUCCESS;
-    }
-
-    // Deposit a dividend into one pool/currency.
+    // Deposit a dividend into one pool/currency. Added to the currency's pot and paid
+    // to live holders at END_EPOCH.
     //  - QU currency (slot where assetName==0): QU is taken from the invocation reward.
     //  - asset currency: `amount` of the asset is pulled from the caller into the contract.
     struct depositDividend_input { uint64 poolId; uint32 currencyIndex; uint64 amount; };
@@ -735,8 +689,6 @@ public:
         uint64 rev;
         uint64 fee;
         bit isQU;
-        uint64 num;
-        uint64 inc;
         uint64 qpayPart;
         DistributeTokenToShareholders_input dtsi;
         DistributeTokenToShareholders_output dtso;
@@ -783,14 +735,11 @@ public:
 
         if (locals.rev == 0) { output.returnCode = QREWARDS_SUCCESS; return; }
 
-        // 5% dividend fee, split 80% QPAY / 20% QREWARDS shareholders.
-        //  - QU  : accrue the whole fee to pendingDivFeeQU; the 80/20 split is applied
-        //          at END_EPOCH via DistributeDivFee.
-        //  - Token: distributed inline here. 20% is sent to the share holders pro-rata by
-        //          iterating the contract share asset (distributeDividends is QU-only), and
-        //          the remainder (80% + rounding dust + any failed shareholder sends) goes
-        //          to the QPAY token dividends address. If no QPAY address is set, the whole
-        //          fee is left in the pool revenue (no fee taken) rather than stranded.
+        // 5% dividend fee, split 80% / 20% (20% -> QREWARDS shareholders for both).
+        //  - QU  : whole fee accrues to pendingDivFeeQU; split 80/20 at END_EPOCH.
+        //  - Token: distributed inline. 20% to shareholders in the token itself; the rest
+        //           (80% + dust + any failed shareholder sends) to the QPAY wallet. No QPAY
+        //           wallet set -> no fee taken on tokens.
         locals.fee = div(locals.rev * QREWARDS_DIVIDEND_FEE_PCT, 100ULL);
         if (locals.fee > 0)
         {
@@ -805,7 +754,6 @@ public:
                 locals.dtsi.issuer = locals.cur.issuer;
                 locals.dtsi.amount = div(locals.fee * QREWARDS_DIVFEE_SHAREHOLDER_PCT, 100ULL);
                 CALL(DistributeTokenToShareholders, locals.dtsi, locals.dtso);
-                // Everything not distributed to shareholders (80% + dust) -> QPAY address.
                 locals.qpayPart = locals.fee - locals.dtso.distributed;
                 if (locals.qpayPart == 0
                     || qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
@@ -815,7 +763,6 @@ public:
                 }
                 else
                 {
-                    // QPAY leg failed: only the shareholder portion actually left SELF.
                     locals.rev -= locals.dtso.distributed;
                 }
             }
@@ -823,20 +770,7 @@ public:
         }
 
         locals.cur.lifetime += locals.rev;
-        locals.rev += locals.cur.pendingRevenue;
-
-        if (locals.meta.totalDistributed > 0)
-        {
-            locals.num = locals.rev * QREWARDS_ACC_SCALE + locals.cur.accRemainder;
-            locals.inc = div(locals.num, locals.meta.totalDistributed);
-            locals.cur.acc += locals.inc;
-            locals.cur.accRemainder = locals.num - locals.inc * locals.meta.totalDistributed;
-            locals.cur.pendingRevenue = 0;
-        }
-        else
-        {
-            locals.cur.pendingRevenue = locals.rev;
-        }
+        locals.cur.pot += locals.rev;
         locals.meta.currencies.set(input.currencyIndex, locals.cur);
         state.mut().poolMeta.set(input.poolId, locals.meta);
 
@@ -965,56 +899,18 @@ public:
     /********FUNCTIONS (read-only)*********/
     /**************************************/
 
-    struct getPosition_input { uint64 poolId; id user; };
-    struct getPosition_output
-    {
-        uint64 profit;
-        Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> pending;
-        uint8 numCurrencies;
-        sint32 returnCode;
-    };
-    struct getPosition_locals
-    {
-        PoolMeta meta;
-        KeyProto proto;
-        id key;
-        Position pos;
-        DivCurrency cur;
-        uint32 k;
-        uint64 pt;
-    };
-    PUBLIC_FUNCTION_WITH_LOCALS(getPosition)
-    {
-        setMemory(output, 0);
-        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
-        locals.meta = state.get().poolMeta.get(input.poolId);
-        setMemory(locals.proto, 0);
-        locals.proto.poolId = input.poolId;
-        locals.proto.wallet = input.user;
-        locals.key = qpi.K12(locals.proto);
-        setMemory(locals.pos, 0);
-        state.get().positions.get(locals.key, locals.pos);
-        output.profit = locals.pos.profit;
-        output.numCurrencies = locals.meta.numCurrencies;
-        for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
-        {
-            locals.cur = locals.meta.currencies.get(locals.k);
-            locals.pt = div(locals.pos.profit * locals.cur.acc, QREWARDS_ACC_SCALE);
-            output.pending.set(locals.k, (locals.pt > locals.pos.debt.get(locals.k)) ? (locals.pt - locals.pos.debt.get(locals.k)) : 0);
-        }
-        output.returnCode = QREWARDS_SUCCESS;
-    }
-
-    struct previewProfit_input { uint64 poolId; id user; };
-    struct previewProfit_output { uint64 profit; sint32 returnCode; };
-    struct previewProfit_locals { ComputeEntitlement_input cei; ComputeEntitlement_output ceo; };
-    PUBLIC_FUNCTION_WITH_LOCALS(previewProfit)
+    // Live weight of a user in a pool (what the END_EPOCH snapshot would record now).
+    // Divide by getPool().lastTotalWeight for an approximate share of the next payout.
+    struct previewWeight_input { uint64 poolId; id user; };
+    struct previewWeight_output { uint64 weight; sint32 returnCode; };
+    struct previewWeight_locals { ComputeEntitlement_input cei; ComputeEntitlement_output ceo; };
+    PUBLIC_FUNCTION_WITH_LOCALS(previewWeight)
     {
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.cei.poolId = input.poolId;
         locals.cei.user = input.user;
         CALL(ComputeEntitlement, locals.cei, locals.ceo);
-        output.profit = locals.ceo.profit;
+        output.weight = locals.ceo.weight;
         output.returnCode = QREWARDS_SUCCESS;
     }
 
@@ -1022,17 +918,17 @@ public:
     struct getPool_output
     {
         id admin;
-        uint64 supply;
-        uint64 totalDistributed;
-        uint64 undistributed;
         uint64 label;
         uint64 operatingBalance;
+        uint64 lastTotalWeight;
         uint32 numAssets;
         uint32 missedEpochs;
         uint8 numCurrencies;
         uint8 active;
         uint8 paused;
         Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyAssetName;
+        Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyPot;
+        Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyLifetime;
         sint32 returnCode;
     };
     struct getPool_locals { PoolMeta meta; uint32 k; DivCurrency cur; };
@@ -1042,12 +938,9 @@ public:
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
         output.admin = locals.meta.admin;
-        output.supply = locals.meta.supply;
-        output.totalDistributed = locals.meta.totalDistributed;
-        output.undistributed = (locals.meta.supply > locals.meta.totalDistributed)
-            ? (locals.meta.supply - locals.meta.totalDistributed) : 0;
         output.label = locals.meta.label;
         output.operatingBalance = locals.meta.operatingBalance;
+        output.lastTotalWeight = locals.meta.lastTotalWeight;
         output.numAssets = locals.meta.numAssets;
         output.missedEpochs = locals.meta.missedEpochs;
         output.numCurrencies = locals.meta.numCurrencies;
@@ -1057,6 +950,8 @@ public:
         {
             locals.cur = locals.meta.currencies.get(locals.k);
             output.currencyAssetName.set(locals.k, locals.cur.assetName); // 0 = QU
+            output.currencyPot.set(locals.k, locals.cur.pot);
+            output.currencyLifetime.set(locals.k, locals.cur.lifetime);
         }
         output.returnCode = QREWARDS_SUCCESS;
     }
@@ -1172,98 +1067,43 @@ public:
         output.totalMatched = locals.matched;
     }
 
-    // One user's positions across up to QREWARDS_MAX_QUERY pools in a single call.
-    struct getPositions_input { id user; uint32 count; Array<uint64, QREWARDS_MAX_QUERY> poolIds; };
-    struct getPositions_output { Array<PositionEntry, QREWARDS_MAX_QUERY> positions; uint32 count; };
-    struct getPositions_locals
-    {
-        uint32 i;
-        uint32 k;
-        uint32 n;
-        uint64 poolId;
-        PoolMeta meta;
-        KeyProto proto;
-        id key;
-        Position pos;
-        DivCurrency cur;
-        uint64 pt;
-        PositionEntry entry;
-    };
-    PUBLIC_FUNCTION_WITH_LOCALS(getPositions)
-    {
-        setMemory(output, 0);
-        locals.n = (input.count > QREWARDS_MAX_QUERY) ? QREWARDS_MAX_QUERY : input.count;
-        for (locals.i = 0; locals.i < locals.n; locals.i++)
-        {
-            setMemory(locals.entry, 0);
-            locals.poolId = input.poolIds.get(locals.i);
-            locals.entry.poolId = locals.poolId;
-            if (locals.poolId < state.get().numPools)
-            {
-                locals.meta = state.get().poolMeta.get(locals.poolId);
-                setMemory(locals.proto, 0);
-                locals.proto.poolId = locals.poolId;
-                locals.proto.wallet = input.user;
-                locals.key = qpi.K12(locals.proto);
-                setMemory(locals.pos, 0);
-                state.get().positions.get(locals.key, locals.pos);
-                locals.entry.profit = locals.pos.profit;
-                locals.entry.numCurrencies = locals.meta.numCurrencies;
-                locals.entry.valid = 1;
-                for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
-                {
-                    locals.cur = locals.meta.currencies.get(locals.k);
-                    locals.pt = div(locals.pos.profit * locals.cur.acc, QREWARDS_ACC_SCALE);
-                    locals.entry.pending.set(locals.k,
-                        (locals.pt > locals.pos.debt.get(locals.k)) ? (locals.pt - locals.pos.debt.get(locals.k)) : 0);
-                }
-            }
-            output.positions.set(locals.i, locals.entry);
-        }
-        output.count = locals.n;
-    }
-
     /**************************************/
     /************REGISTRATION**************/
     /**************************************/
     REGISTER_USER_FUNCTIONS_AND_PROCEDURES()
     {
-        REGISTER_USER_FUNCTION(getPosition, 1);
-        REGISTER_USER_FUNCTION(previewProfit, 2);
-        REGISTER_USER_FUNCTION(getPool, 3);
-        REGISTER_USER_FUNCTION(getPoolAsset, 4);
-        REGISTER_USER_FUNCTION(getPlatform, 5);
-        REGISTER_USER_FUNCTION(getAllPoolAssets, 6);
-        REGISTER_USER_FUNCTION(getFundingRoute, 7);
-        REGISTER_USER_FUNCTION(getPoolsByAdmin, 8);
-        REGISTER_USER_FUNCTION(getPositions, 9);
-        REGISTER_USER_FUNCTION(isExcluded, 10);
+        REGISTER_USER_FUNCTION(getPool, 1);
+        REGISTER_USER_FUNCTION(getPoolAsset, 2);
+        REGISTER_USER_FUNCTION(getAllPoolAssets, 3);
+        REGISTER_USER_FUNCTION(getPlatform, 4);
+        REGISTER_USER_FUNCTION(getFundingRoute, 5);
+        REGISTER_USER_FUNCTION(getPoolsByAdmin, 6);
+        REGISTER_USER_FUNCTION(isExcluded, 7);
+        REGISTER_USER_FUNCTION(previewWeight, 8);
 
         REGISTER_USER_PROCEDURE(createPool, 1);
         REGISTER_USER_PROCEDURE(registerAsset, 2);
         REGISTER_USER_PROCEDURE(updateAsset, 3);
         REGISTER_USER_PROCEDURE(updateWeight, 4);
         REGISTER_USER_PROCEDURE(setPoolAdmin, 5);
-        REGISTER_USER_PROCEDURE(syncProfit, 6);
-        REGISTER_USER_PROCEDURE(claimDividends, 7);
-        REGISTER_USER_PROCEDURE(depositDividend, 8);
-        REGISTER_USER_PROCEDURE(setPlatformParams, 9);
-        REGISTER_USER_PROCEDURE(setPlatformOwner, 10);
-        REGISTER_USER_PROCEDURE(TransferShareManagementRights, 11);
-        REGISTER_USER_PROCEDURE(registerAssets, 12);
-        REGISTER_USER_PROCEDURE(addDividendCurrency, 13);
-        REGISTER_USER_PROCEDURE(setFundingRoute, 14);
-        REGISTER_USER_PROCEDURE(depositOperating, 15);
-        REGISTER_USER_PROCEDURE(setQpayhubAddress, 16);
-        REGISTER_USER_PROCEDURE(setExcludedAddress, 17);
-        REGISTER_USER_PROCEDURE(setQpayTokenDividendsAddress, 18);
+        REGISTER_USER_PROCEDURE(depositDividend, 6);
+        REGISTER_USER_PROCEDURE(depositOperating, 7);
+        REGISTER_USER_PROCEDURE(setPlatformParams, 8);
+        REGISTER_USER_PROCEDURE(setPlatformOwner, 9);
+        REGISTER_USER_PROCEDURE(TransferShareManagementRights, 10);
+        REGISTER_USER_PROCEDURE(registerAssets, 11);
+        REGISTER_USER_PROCEDURE(addDividendCurrency, 12);
+        REGISTER_USER_PROCEDURE(setFundingRoute, 13);
+        REGISTER_USER_PROCEDURE(setQpayhubAddress, 14);
+        REGISTER_USER_PROCEDURE(setExcludedAddress, 15);
+        REGISTER_USER_PROCEDURE(setQpayTokenDividendsAddress, 16);
     }
 
     INITIALIZE()
     {
         state.mut().platformOwner = NULL_ID;
         state.mut().qpayhubAddress = NULL_ID;
-        // QPAY token dividends wallet (receives the 80% QPAY share of the 5% dividend fee).
+        // QPAY token dividends wallet (receives the 80% QPAY share of the 5% TOKEN dividend fee).
         state.mut().qpayTokenDividendsAddress = ID(_Q, _P, _A, _Y, _N, _O, _W, _S, _W, _Z, _M, _G, _H, _F, _E, _A, _E, _V, _J, _X, _G, _Z, _A, _V, _S, _H, _A, _B, _A, _Z, _D, _D, _B, _D, _I, _H, _T, _E, _B, _O, _P, _C, _O, _G, _H, _R, _G, _B, _C, _Y, _C, _U, _Z, _O, _H, _C);
         state.mut().createPoolFee = QREWARDS_DEFAULT_CREATE_FEE;
         state.mut().operatingFee = QREWARDS_DEFAULT_OPERATING_FEE;
@@ -1281,11 +1121,13 @@ public:
         DistributeFee_output dfo;
         DistributeDivFee_input ddfi;
         DistributeDivFee_output ddfo;
+        DistributePool_input dpi;
+        DistributePool_output dpo;
     };
     END_EPOCH_WITH_LOCALS()
     {
-        // Draw the per-epoch operating fee from each active pool; underfunded pools
-        // are paused, and deactivated after being paused more than QREWARDS_MAX_MISSED_EPOCHS.
+        // 1) Draw the per-epoch operating fee from each active pool; underfunded pools
+        //    are paused, and deactivated after being paused more than QREWARDS_MAX_MISSED_EPOCHS.
         locals.fee = state.get().operatingFee;
         locals.collected = 0;
         for (locals.i = 0; locals.i < state.get().numPools; locals.i++)
@@ -1316,7 +1158,7 @@ public:
             CALL(DistributeFee, locals.dfi, locals.dfo);
         }
 
-        // Flush the accrued 5% QU dividend fee: 80% QPAYHUB / 20% QREWARDS shareholders.
+        // 2) Flush the accrued 5% QU dividend fee: 80% QPAYHUB / 20% QREWARDS shareholders.
         if (state.get().pendingDivFeeQU > 0)
         {
             locals.ddfi.amount = state.get().pendingDivFeeQU;
@@ -1324,12 +1166,19 @@ public:
             state.mut().pendingDivFeeQU = 0;
         }
 
-        state.mut().positions.cleanupIfNeeded();
+        // 3) Distribute each active pool's currency pots to live holders by weight.
+        for (locals.i = 0; locals.i < state.get().numPools; locals.i++)
+        {
+            locals.dpi.poolId = locals.i;
+            CALL(DistributePool, locals.dpi, locals.dpo);
+        }
+        state.mut().snapshot.reset();
+
         state.mut().fundingRoute.cleanupIfNeeded();
         state.mut().excluded.cleanupIfNeeded();
     }
 
-    // Credit plain incoming QU to a routed pool's QU currency (slot 0).
+    // Credit plain incoming QU to a routed pool's QU pot (slot 0).
     // Only standard wallet transfers and contract qpi.transfers are routed;
     // procedure/other-contract-invocation transfers are handled by depositDividend,
     // so they are skipped here to avoid double counting.
@@ -1340,8 +1189,6 @@ public:
         DivCurrency cur;
         uint64 rev;
         uint64 fee;
-        uint64 num;
-        uint64 inc;
     };
     POST_INCOMING_TRANSFER_WITH_LOCALS()
     {
@@ -1354,7 +1201,7 @@ public:
 
         locals.cur = locals.meta.currencies.get(0); // slot 0 is always QU
         locals.rev = (uint64)input.amount;
-        // 5% dividend fee -> pendingDivFeeQU (flushed 80/20 at END_EPOCH); 95% to the pool.
+        // 5% dividend fee -> pendingDivFeeQU (flushed 80/20 at END_EPOCH); 95% to the pot.
         locals.fee = div(locals.rev * QREWARDS_DIVIDEND_FEE_PCT, 100ULL);
         if (locals.fee > 0)
         {
@@ -1362,19 +1209,7 @@ public:
             locals.rev -= locals.fee;
         }
         locals.cur.lifetime += locals.rev;
-        locals.rev += locals.cur.pendingRevenue;
-        if (locals.meta.totalDistributed > 0)
-        {
-            locals.num = locals.rev * QREWARDS_ACC_SCALE + locals.cur.accRemainder;
-            locals.inc = div(locals.num, locals.meta.totalDistributed);
-            locals.cur.acc += locals.inc;
-            locals.cur.accRemainder = locals.num - locals.inc * locals.meta.totalDistributed;
-            locals.cur.pendingRevenue = 0;
-        }
-        else
-        {
-            locals.cur.pendingRevenue = locals.rev;
-        }
+        locals.cur.pot += locals.rev;
         locals.meta.currencies.set(0, locals.cur);
         state.mut().poolMeta.set(locals.poolId, locals.meta);
     }
