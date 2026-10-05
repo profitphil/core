@@ -1316,8 +1316,11 @@ public:
         // share and the 80% QU dividend-fee leg; its POST_INCOMING_TRANSFER auto-credits plain
         // QU to its feePool). QPAYHUB is CONTRACT_INDEX 29 on the live chain.
         state.mut().qpayhubAddress = id(29, 0, 0, 0);
-        // QPAY token dividends wallet (receives the 80% QPAY share of the 5% TOKEN dividend fee).
-        state.mut().qpayTokenDividendsAddress = ID(_Q, _P, _A, _Y, _N, _O, _W, _S, _W, _Z, _M, _G, _H, _F, _E, _A, _E, _V, _J, _X, _G, _Z, _A, _V, _S, _H, _A, _B, _A, _Z, _D, _D, _B, _D, _I, _H, _T, _E, _B, _O, _P, _C, _O, _G, _H, _R, _G, _B, _C, _Y, _C, _U, _Z, _O, _H, _C);
+        // Destination for the 80% leg of the 5% TOKEN dividend fee: the QRaffle charity
+        // address (DPQRLSZSSCXIYFIQGBFBXXISDDEBEGQNWNTQUEIFSCUWGHVXJPLFGMYD...), a plain
+        // wallet that simply receives the tokens. (The 20% shareholder leg is unchanged.)
+        // Owner-tunable via setQpayTokenDividendsAddress.
+        state.mut().qpayTokenDividendsAddress = ID(_D, _P, _Q, _R, _L, _S, _Z, _S, _S, _C, _X, _I, _Y, _F, _I, _Q, _G, _B, _F, _B, _X, _X, _I, _S, _D, _D, _E, _B, _E, _G, _Q, _N, _W, _N, _T, _Q, _U, _E, _I, _F, _S, _C, _U, _W, _G, _H, _V, _X, _J, _P, _L, _F, _G, _M, _Y, _D);
         state.mut().createPoolFee = QREWARDS_DEFAULT_CREATE_FEE;
         state.mut().operatingFee = QREWARDS_DEFAULT_OPERATING_FEE;
         state.mut().pendingDivFeeQU = 0;

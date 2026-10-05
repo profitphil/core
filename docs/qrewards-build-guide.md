@@ -54,7 +54,7 @@ removes that whole class of bug at the root.
 | Reward basis | **Live holdings**, read each epoch; no persistent reward-token balance. |
 | Dividend currencies | **QU** (slot 0) + up to 3 asset currencies per pool (`MAX_DIV_CURRENCIES = 4`). |
 | Distribution | At `END_EPOCH`, each pool's per-currency **pot** split pro-rata by live weight. Rounding dust carries to the next epoch's pot. |
-| Dividend fee | **5%** of every deposit (QU **and** tokens), split **80% / 20%**: 20% → QREWARDS shareholders; 80% → **QPAYHUB dividends account for QU**, **QPAY wallet for tokens**. **95% reaches holders.** |
+| Dividend fee | **5%** of every deposit (QU **and** tokens), split **80% / 20%**: 20% → QREWARDS shareholders; 80% → **QPAYHUB dividends account for QU**, **QRaffle charity address for tokens**. **95% reaches holders.** |
 | Pool creation | **Open**. Fee **5,000,000 QU** (protocol-owner tunable), split **70% QREWARDS shareholders / 15% QPAYHUB address / 15% burn**. Any excess seeds the pool's operating balance. |
 | Operating fee | **100,000 QU/epoch per pool** (protocol-owner tunable), drawn at `END_EPOCH` from a per-pool operating balance the admin tops up (`depositOperating`); same 70/15/15 split. Underfunded → **paused up to `QREWARDS_MAX_MISSED_EPOCHS` (2) epochs, then deactivated**. A paused/inactive pool is skipped by distribution and its pot carries. |
 | Excluded addresses | Per-pool `setExcludedAddress`; an excluded address's weight is forced to 0 (earns nothing, dilutes nobody). |
@@ -172,17 +172,20 @@ giant single pool would need intra-pool freeze pagination — not implemented (c
   accrues to `pendingDivFeeQU` and is flushed at `END_EPOCH`: 20% via `distributeDividends`,
   80% (+ rounding) via a bare `qpi.transfer` that QPAYHUB's `POST_INCOMING_TRANSFER`
   auto-credits into its `feePool`. Burned if `qpayhubAddress` is unset.
-- **Token dividend → 80% to the QPAY wallet (`qpayTokenDividendsAddress`).** Settled inline at
-  deposit: 20% to shareholders paid **in the token itself** by iterating the contract share
-  asset (`"QREWARD"` packed = `19230739006837329`, issuer `NULL_ID`) via
+- **Token dividend → 80% to the QRaffle charity address (`qpayTokenDividendsAddress`).** Settled
+  inline at deposit: 20% to shareholders paid **in the token itself** by iterating the contract
+  share asset (`"QREWARD"` packed = `19230739006837329`, issuer `NULL_ID`) via
   `DistributeTokenToShareholders`; the rest (80% + dust + any failed shareholder sends) → the
-  QPAY wallet. No QPAY wallet set → no fee is taken on tokens.
+  charity address. Unset → no fee is taken on tokens.
 
 Why two destinations: QPAYHUB's `feePool` only accepts **plain QU** (its `POST_INCOMING_TRANSFER`
-ignores incoming assets), so token fees can't be credited there and go to the QPAY wallet instead.
+ignores incoming assets), so token fees can't be credited there. They are instead sent to the
+**QRaffle charity address** (a plain wallet that simply receives the tokens) — note QRaffle itself
+has no handler to redistribute tokens sent to its *contract* address, so the charity *wallet* is
+used, not the QRaffle contract. `qpayTokenDividendsAddress` is owner-tunable.
 
 The per-share flooring in the token shareholder leg means it only pays out once `20% of the fee
-≥ NUMBER_OF_COMPUTORS (676)`; below that it rounds to 0 and the whole fee folds to the QPAY wallet.
+≥ NUMBER_OF_COMPUTORS (676)`; below that it rounds to 0 and the whole fee folds to the charity address.
 
 ---
 
