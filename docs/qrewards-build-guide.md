@@ -56,7 +56,7 @@ removes that whole class of bug at the root.
 | Distribution | At `END_EPOCH`, each pool's per-currency **pot** split pro-rata by live weight. Rounding dust carries to the next epoch's pot. |
 | Dividend fee | **5%** of every deposit (QU **and** tokens), split **80% / 20%**: 20% → QREWARDS shareholders; 80% → **QPAYHUB dividends account for QU**, **QRaffle charity address for tokens**. **95% reaches holders.** |
 | Pool creation | **Open**. Fee **5,000,000 QU** (protocol-owner tunable), split **70% QREWARDS shareholders / 15% QPAYHUB address / 15% burn**. Any excess seeds the pool's operating balance. |
-| Operating fee | **100,000 QU/epoch per pool** (protocol-owner tunable), drawn at `END_EPOCH` from a per-pool operating balance the admin tops up (`depositOperating`); same 70/15/15 split. Underfunded → **paused up to `QREWARDS_MAX_MISSED_EPOCHS` (2) epochs, then deactivated**. A paused/inactive pool is skipped by distribution and its pot carries. |
+| Operating fee | **100,000 QU/epoch per pool** (protocol-owner tunable), drawn at `END_EPOCH` from a per-pool operating balance the admin tops up (`depositOperating`); same 70/15/15 split. Underfunded → **paused up to `QREWARDS_MAX_MISSED_EPOCHS` (2) epochs, then deactivated**. On deactivation the pool's remaining funds (every currency's `pot + distributable`, plus the leftover operating balance) are **refunded to the pool admin** so nothing is stranded. |
 | Excluded addresses | Per-pool `setExcludedAddress`; an excluded address's weight is forced to 0 (earns nothing, dilutes nobody). |
 | Split-resistance | Per-asset weight = `(held/unit) × concentrationMultiplier × weightBps`; the multiplier rises with holding size, so splitting a balance across wallets never increases total weight. |
 
@@ -107,6 +107,12 @@ The multiplier is **per asset** (keyed on that asset's `basePoints`), so a holde
 weight is the sum of independent per-asset contributions — which is exactly what lets the
 `END_EPOCH` snapshot total everyone up by walking each asset's holder list once.
 
+**Overflow safety:** each per-asset contribution is computed in **128-bit and saturated** to
+`uint64` (`weightContribution`), and a holder's summed weight is saturated too (capping a
+numerator can only under-pay). The pool's `totalWeight` denominator is the **exact `uint128` sum**
+of the stored per-holder weights, so `pot × weight / totalWeight` is computed with no 64-bit wrap
+and `Σ payouts ≤ pot` always holds.
+
 `previewWeight(poolId, wallet)` returns this live weight; divide by `getPool().lastTotalWeight`
 for an approximate share of the next payout.
 
@@ -116,7 +122,8 @@ for an approximate share of the next payout.
 
 For the whole contract, once per epoch:
 1. **Operating fee:** draw `operatingFee` from each active pool's `operatingBalance`. Underfunded
-   → pause (and deactivate after `MAX_MISSED_EPOCHS`). Collected fees → `DistributeFee` (70/15/15).
+   → pause (and deactivate after `MAX_MISSED_EPOCHS`; on deactivation, remaining pot/distributable
+   and leftover operating balance are refunded to the pool admin). Collected fees → `DistributeFee`.
 2. **Dividend-fee flush:** `pendingDivFeeQU` → `DistributeDivFee` (20% shareholders via
    `distributeDividends`, 80% + rounding to `qpayhubAddress`, burned if unset).
 3. **Distribution:** for each pool, `DistributePool`:

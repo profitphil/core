@@ -195,7 +195,10 @@ public:
         uint32 streamPoolCursor;     // pool being processed this cycle
         uint8  streamCurrencyCursor; // currency index within the current pool
         sint64 streamPayCursor;      // snapshot element index last paid (resume via nextElementIndex)
-        uint64 streamTotalWeight;    // frozen total weight of the current pool
+        // Frozen exact total weight of the current pool, stored as hi/lo (uint128 has no default
+        // constructor, so it is not used directly as a state field; reassembled where needed).
+        uint64 streamTotalWeightHi;
+        uint64 streamTotalWeightLo;
         uint64 streamFrozenAmt;      // frozen distributable amount of the current currency
         uint64 streamPaidSum;        // amount paid so far for the current currency
     };
@@ -222,6 +225,20 @@ protected:
         prod = prod * (uint128)weightBps;
         uint128 q = div<uint128>(prod, (uint128)(QREWARDS_BPS * QREWARDS_BPS));
         return (q.high != 0) ? 0xFFFFFFFFFFFFFFFFULL : q.low;
+    }
+
+    // Saturating uint128 -> uint64 (for the informational lastTotalWeight field).
+    inline static uint64 sat64(uint128 v)
+    {
+        return (v.high != 0) ? 0xFFFFFFFFFFFFFFFFULL : v.low;
+    }
+
+    // Saturating a + b in uint64 (a holder's summed weight; capping a numerator can only
+    // under-pay, never over-draw, so this is safe).
+    inline static uint64 satAdd64(uint64 a, uint64 b)
+    {
+        uint64 s = a + b;
+        return (s < a) ? 0xFFFFFFFFFFFFFFFFULL : s;
     }
 
     // Live weight of one user in one pool: sum over the pool's active registered
@@ -272,7 +289,7 @@ protected:
             if (locals.pts == 0) continue;
             locals.mult = concentrationMultiplier(locals.pts);
             locals.add = weightContribution(locals.pts, locals.mult, (uint64)locals.rule.weightBps);
-            output.weight += locals.add;
+            output.weight = satAdd64(output.weight, locals.add);
         }
     }
 
@@ -377,7 +394,7 @@ protected:
     // tick (the ledger iterator cannot be resumed across ticks). Excluded addresses and SELF
     // are skipped. Shared by END_EPOCH distribution and the streamed engine's freeze step.
     struct SnapshotPool_input { uint64 poolId; };
-    struct SnapshotPool_output { uint64 totalWeight; };
+    struct SnapshotPool_output { uint128 totalWeight; }; // exact sum of stored per-holder weights
     struct SnapshotPool_locals
     {
         PoolMeta meta;
@@ -395,6 +412,7 @@ protected:
         uint64 mult;
         uint64 add;
         uint64 existing;
+        uint64 stored;
     };
     PRIVATE_PROCEDURE_WITH_LOCALS(SnapshotPool)
     {
@@ -431,11 +449,14 @@ protected:
                             {
                                 locals.existing = 0;
                                 state.get().snapshot.get(locals.holder, locals.existing);
+                                locals.stored = satAdd64(locals.existing, locals.add); // per-holder cap
                                 // Only count the weight if it is actually stored (an existing key
                                 // updates in place; a new key is dropped iff the map is full).
-                                if (state.mut().snapshot.set(locals.holder, locals.existing + locals.add) != NULL_INDEX)
+                                if (state.mut().snapshot.set(locals.holder, locals.stored) != NULL_INDEX)
                                 {
-                                    output.totalWeight += locals.add;
+                                    // totalWeight is the EXACT uint128 sum of stored per-holder
+                                    // weights, so sum(payouts) can never exceed the pot.
+                                    output.totalWeight = output.totalWeight + (uint128)(locals.stored - locals.existing);
                                 }
                             }
                         }
@@ -456,7 +477,7 @@ protected:
         PoolMeta meta;
         SnapshotPool_input spi;
         SnapshotPool_output spo;
-        uint64 totalWeight;
+        uint128 totalWeight;
         uint32 k;
         DivCurrency cur;
         sint64 idx;
@@ -476,8 +497,8 @@ protected:
         CALL(SnapshotPool, locals.spi, locals.spo);
         locals.totalWeight = locals.spo.totalWeight;
 
-        locals.meta.lastTotalWeight = locals.totalWeight;
-        if (locals.totalWeight == 0)
+        locals.meta.lastTotalWeight = sat64(locals.totalWeight);
+        if (!locals.totalWeight) // == 0
         {
             state.mut().poolMeta.set(input.poolId, locals.meta); // no eligible holders: pots carry
             return;
@@ -496,7 +517,7 @@ protected:
                 locals.weight = state.get().snapshot.value(locals.idx);
                 if (locals.weight == 0) continue;
                 locals.prod = (uint128)locals.cur.pot * (uint128)locals.weight;
-                locals.pay128 = div<uint128>(locals.prod, (uint128)locals.totalWeight);
+                locals.pay128 = div<uint128>(locals.prod, locals.totalWeight);
                 locals.payout = locals.pay128.low; // <= pot, fits uint64
                 if (locals.payout == 0) continue;
                 if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
@@ -571,9 +592,10 @@ protected:
                 }
                 locals.spi.poolId = state.get().streamPoolCursor;
                 CALL(SnapshotPool, locals.spi, locals.spo);
-                locals.meta.lastTotalWeight = locals.spo.totalWeight;
+                locals.meta.lastTotalWeight = sat64(locals.spo.totalWeight);
                 state.mut().poolMeta.set(state.get().streamPoolCursor, locals.meta);
-                state.mut().streamTotalWeight = locals.spo.totalWeight;
+                state.mut().streamTotalWeightHi = locals.spo.totalWeight.high;
+                state.mut().streamTotalWeightLo = locals.spo.totalWeight.low;
                 state.mut().streamState = QREWARDS_STREAM_PAYING;
                 state.mut().streamCurrencyCursor = 0;
                 state.mut().streamCurrencyStarted = 0;
@@ -584,7 +606,7 @@ protected:
             // PAYING
             locals.meta = state.get().poolMeta.get(state.get().streamPoolCursor);
             if (state.get().streamCurrencyCursor >= locals.meta.numCurrencies
-                || state.get().streamTotalWeight == 0)
+                || (state.get().streamTotalWeightHi == 0 && state.get().streamTotalWeightLo == 0))
             {
                 state.mut().streamPoolCursor = state.get().streamPoolCursor + 1;
                 state.mut().streamState = QREWARDS_STREAM_IDLE;
@@ -621,7 +643,7 @@ protected:
             state.mut().streamPayCursor = locals.idx;
             if (locals.weight == 0) continue;
             locals.prod = (uint128)state.get().streamFrozenAmt * (uint128)locals.weight;
-            locals.pay128 = div<uint128>(locals.prod, (uint128)state.get().streamTotalWeight);
+            locals.pay128 = div<uint128>(locals.prod, uint128(state.get().streamTotalWeightHi, state.get().streamTotalWeightLo));
             locals.payout = locals.pay128.low;
             if (locals.payout == 0) continue;
             if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
@@ -1297,7 +1319,8 @@ public:
         state.mut().streamPoolCursor = 0;
         state.mut().streamCurrencyCursor = 0;
         state.mut().streamPayCursor = NULL_INDEX;
-        state.mut().streamTotalWeight = 0;
+        state.mut().streamTotalWeightHi = 0;
+        state.mut().streamTotalWeightLo = 0;
         state.mut().streamFrozenAmt = 0;
         state.mut().streamPaidSum = 0;
     }
@@ -1320,6 +1343,9 @@ public:
         DistributeDivFee_output ddfo;
         DistributePool_input dpi;
         DistributePool_output dpo;
+        uint32 k;
+        DivCurrency cur;
+        uint64 refundAmt;
     };
     END_EPOCH_WITH_LOCALS()
     {
@@ -1345,6 +1371,30 @@ public:
                 if (locals.meta.missedEpochs > QREWARDS_MAX_MISSED_EPOCHS)
                 {
                     locals.meta.active = 0; // paused > MAX epochs -> deactivate
+                    // Refund the deactivated pool's remaining funds to its admin so nothing is
+                    // stranded: each currency's (pot + distributable), plus the leftover
+                    // operating balance. Tokens are managed by SELF, so they transfer out.
+                    for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+                    {
+                        locals.cur = locals.meta.currencies.get(locals.k);
+                        locals.refundAmt = locals.cur.pot + locals.cur.distributable;
+                        if (locals.refundAmt > 0)
+                        {
+                            if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
+                                qpi.transfer(locals.meta.admin, (sint64)locals.refundAmt);
+                            else
+                                qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
+                                    SELF, SELF, (sint64)locals.refundAmt, locals.meta.admin);
+                            locals.cur.pot = 0;
+                            locals.cur.distributable = 0;
+                            locals.meta.currencies.set(locals.k, locals.cur);
+                        }
+                    }
+                    if (locals.meta.operatingBalance > 0)
+                    {
+                        qpi.transfer(locals.meta.admin, (sint64)locals.meta.operatingBalance);
+                        locals.meta.operatingBalance = 0;
+                    }
                 }
             }
             state.mut().poolMeta.set(locals.i, locals.meta);

@@ -302,6 +302,31 @@ TEST(ContractQRewards, CreatePoolAndWeight)
     EXPECT_EQ(t.previewWeight(pool, QR_BOB), 0u);
 }
 
+// A pool that misses its operating fee long enough to be deactivated refunds its remaining
+// funds (pot + distributable + leftover operating balance) to the pool admin.
+TEST(ContractQRewards, RefundOnDeactivation)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_FUND, 5000000000ULL);
+
+    // 50,000 operating buffer (< 100,000 fee) so the pool pauses from the first END_EPOCH.
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE + 50000ULL);
+    t.depositQU(QR_FUND, pool, 10000ULL); // pot 9500 (fee 500)
+    EXPECT_EQ(t.getState()->poolPot(pool, 0), 9500u);
+
+    t.endEpoch(); // underfunded -> paused (missed 1)
+    t.endEpoch(); // paused (missed 2)
+    EXPECT_EQ(t.getState()->poolActive(pool), 1);
+
+    long long adminBefore = getBalance(QR_ADMIN);
+    t.endEpoch(); // missed 3 > MAX -> deactivate + refund to admin
+    EXPECT_EQ(t.getState()->poolActive(pool), 0);
+    // Refund = pot (9500) + leftover operating balance (50000) = 59500.
+    EXPECT_EQ(getBalance(QR_ADMIN) - adminBefore, 59500LL);
+    EXPECT_EQ(t.getState()->poolPot(pool, 0), 0u);
+}
+
 // Regression: the weight multiply must not overflow uint64. With unit=1, weight=100x and a
 // 2e9 holding, pts*mult*weightBps = 2e9 * 20000 * 1e6 = 4e19 > 2^64 would wrap in 64-bit math;
 // the 128-bit path yields the correct 4e11.
