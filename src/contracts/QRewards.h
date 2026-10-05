@@ -39,7 +39,8 @@ constexpr uint32 QREWARDS_MAX_ASSETS_PER_POOL  = 64;
 constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES   = 4;          // QU + up to 3 assets per pool
 constexpr uint32 QREWARDS_MAX_BATCH            = 16;         // assets per registerAssets call
 constexpr uint32 QREWARDS_MAX_RECIP_BATCH      = 24;         // recipients per addRecipients call (MAX_INPUT_SIZE=1024)
-constexpr uint64 QREWARDS_MAX_RECIPIENTS       = 131072;     // 2^17: shared recipient-list entries across all pools
+constexpr uint64 QREWARDS_MAX_RECIPIENTS       = 1048576;    // 2^20: shared recipient-list entries across ALL pools
+                                                            // (~96MB of the 1GB state budget; per-pool effective cap is still SNAPSHOT_CAP)
 constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool routing entries for tagged QU transfers
 constexpr uint32 QREWARDS_PAGE                 = 256;        // page size for paginated views
 constexpr uint64 QREWARDS_SNAPSHOT_CAP         = 16384;      // 2^14: max unique holders per pool in one epoch snapshot
@@ -1005,17 +1006,31 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // Clear a pool's entire recipient list in O(1) by bumping its listVersion; prior-version entries
-    // are ignored by distribution and reclaimed on map cleanup / overwrite.
+    // Clear a pool's entire recipient list. Physically removes the pool's entries so their slots in
+    // the shared, finite `recipients` map are reclaimed (a bare version bump would leave them as live
+    // occupants forever -> a slow leak toward lockout). listVersion is still bumped so any entry not
+    // yet compacted is ignored immediately. The scan is O(map size) but admin-initiated and rare.
     struct clearRecipients_input { uint64 poolId; };
-    struct clearRecipients_output { sint32 returnCode; };
-    struct clearRecipients_locals { PoolMeta meta; };
+    struct clearRecipients_output { sint32 returnCode; uint32 removed; };
+    struct clearRecipients_locals { PoolMeta meta; sint64 idx; };
     PUBLIC_PROCEDURE_WITH_LOCALS(clearRecipients)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        output.removed = 0;
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        for (locals.idx = state.get().recipients.nextElementIndex(NULL_INDEX);
+             locals.idx != NULL_INDEX;
+             locals.idx = state.get().recipients.nextElementIndex(locals.idx))
+        {
+            if (state.get().recipients.value(locals.idx).poolId == input.poolId)
+            {
+                state.mut().recipients.removeByIndex(locals.idx); // marks slot reusable; safe mid-iteration
+                output.removed++;
+            }
+        }
+        state.mut().recipients.cleanupIfNeeded();
         locals.meta.listVersion++;
         state.mut().poolMeta.set(input.poolId, locals.meta);
         output.returnCode = QREWARDS_SUCCESS;
@@ -1578,6 +1593,7 @@ public:
 
         state.mut().fundingRoute.cleanupIfNeeded();
         state.mut().excluded.cleanupIfNeeded();
+        state.mut().recipients.cleanupIfNeeded();
     }
 
     // Streamed-mode driver. Once per epoch, after streamDelayTicks have elapsed, start a

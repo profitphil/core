@@ -220,9 +220,19 @@ streamed), exactly like a holdings pool; only the recipient set changes.
   for pro-rata, weight them accordingly. Deduped by wallet and tagged with the pool's current
   `listVersion`. Up to `QREWARDS_MAX_RECIP_BATCH` (24) per call (bounded by `MAX_INPUT_SIZE = 1024`);
   call repeatedly for longer lists. A pool's **effective** list is capped at `QREWARDS_SNAPSHOT_CAP`
-  (16,384) — entries beyond that don't fit the per-epoch snapshot and aren't paid.
-- **`clearRecipients(poolId)`** — empties the list in O(1) by bumping `listVersion`; prior-version
-  entries are ignored by distribution and reclaimed on map cleanup/overwrite.
+  (16,384) — entries beyond that don't fit the per-epoch snapshot and aren't paid. Weights are
+  clamped to `QREWARDS_MAX_LIST_WEIGHT` (1e12) to keep the payout product within uint128.
+- **`clearRecipients(poolId)`** — empties the list: it scans the shared map and physically removes
+  the pool's entries (reclaiming their slots) and bumps `listVersion`. The scan is O(map size) but
+  admin-initiated and rare; a bare version bump would leak slots permanently.
+
+**Shared capacity.** All list-mode pools share one `recipients` map of `QREWARDS_MAX_RECIPIENTS`
+(2^20 = 1,048,576) entries, keyed by `K12(poolId, wallet)`. This is a *shared* total across every
+pool — not per pool — so e.g. 64 pools could each hold a full 16,384-entry list, or 1,024 pools
+~1,024 each. You cannot give all 1,024 pools a full 16,384-entry list at once (that would need ~16.7M
+entries, over the 1 GB state limit); the map is a shared budget. At ~96 MB it is the contract's
+largest structure but still well under the 1 GB cap, so it can be raised further if needed. Removed
+(`weight 0`) and cleared entries are reclaimed by `cleanupIfNeeded()` at `END_EPOCH`.
 
 If a list-mode pool has no eligible recipients at distribution time (empty/cleared list), its pot is
 simply retained and carries to the next epoch, same as a holdings pool with no eligible holders.
