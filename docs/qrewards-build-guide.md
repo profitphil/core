@@ -68,13 +68,15 @@ removes that whole class of bug at the root.
 struct AssetRule   { uint64 assetName; id issuer; uint64 unit; uint32 weightBps; uint8 kind; uint8 active; };
 struct DivCurrency { uint64 assetName; id issuer; uint64 pot; uint64 lifetime; uint8 active; }; // assetName==0&&issuer==NULL_ID => QU
 struct PoolMeta    { id admin; uint64 label, operatingBalance, lastTotalWeight;
-                     uint32 numAssets, missedEpochs; uint8 numCurrencies, active, paused;
+                     uint32 numAssets, missedEpochs, listVersion; uint8 numCurrencies, active, paused, targetMode;
                      Array<DivCurrency, 4> currencies; };
-struct KeyProto    { uint64 poolId; id wallet; };   // zeroed then hashed -> composite exclusion key
+struct KeyProto    { uint64 poolId; id wallet; };   // zeroed then hashed -> composite exclusion/recipient key
+struct RecipientEntry { id wallet; uint64 poolId, weight; uint32 version; }; // list-mode payout target
 
 struct StateData {
     HashMap<id, uint8,  QREWARDS_MAX_EXCLUSIONS> excluded;   // key = K12(poolId, address) -> 1
     HashMap<id, uint64, QREWARDS_SNAPSHOT_CAP>   snapshot;   // scratch holder->weight, rebuilt per pool at END_EPOCH
+    HashMap<id, RecipientEntry, QREWARDS_MAX_RECIPIENTS> recipients; // key = K12(poolId, wallet), list-mode targets
     uint64 pendingDivFeeQU;                                  // QU dividend-fee skim, flushed 80/20 at END_EPOCH
     Array<PoolMeta, QREWARDS_MAX_POOLS>  poolMeta;
     Array<AssetRule, MAX_POOLS*MAX_ASSETS_PER_POOL> registry; // flat: pool p asset i at p*MAX_ASSETS + i
@@ -202,14 +204,26 @@ The per-share flooring in the token shareholder leg means it only pays out once 
 · `setPoolAdmin(5)` · `depositDividend(6)` · `depositOperating(7)` · `setPlatformParams(8)` (owner)
 · `TransferShareManagementRights(9)` · `registerAssets(10)` (batch, ≤16) · `addDividendCurrency(11)`
 · `setFundingRoute(12)` · `setExcludedAddress(13)` (pool admin) · `setDistributionMode(14)` (owner)
-· `distributeToList(15)` (pool admin).
+· `setTargetMode(15)` · `addRecipients(16)` · `clearRecipients(17)` (all pool admin).
 
-**`distributeToList` (admin airdrop):** a pool admin can pay an **explicit list of wallets** directly,
-independent of the holdings-based dividends. The admin funds it in the same call — QU as the attached
-reward (must cover the sum of `amounts`; leftover refunded), or a token the admin has granted QREWARDS
-to manage (moved straight from the admin to each wallet). Up to `QREWARDS_MAX_AIRDROP` (20) wallets per
-call (bounded by `MAX_INPUT_SIZE = 1024`); call repeatedly for longer lists. It never touches any pool
-pot or holder weights — `poolId` is used only to authorize the caller as that pool's admin.
+**Recipient-list distribution (`targetMode == LIST`):** instead of paying asset holders, a pool can
+pay an **explicit, admin-uploaded wallet list**, pro-rata by weight. No QU is attached per wallet —
+the pool's accumulated `pot` is distributed automatically by the normal engine (END_EPOCH or
+streamed), exactly like a holdings pool; only the recipient set changes.
+
+- **`setTargetMode(poolId, mode)`** — switch a pool between by-holdings (`0`, default) and by-list
+  (`1`). Admin only.
+- **`addRecipients(poolId, count, wallets[], weights[])`** — add/update (`weight > 0`) or remove
+  (`weight == 0`) recipients. For an **equal split**, give every wallet the same weight (e.g. `1`);
+  for pro-rata, weight them accordingly. Deduped by wallet and tagged with the pool's current
+  `listVersion`. Up to `QREWARDS_MAX_RECIP_BATCH` (24) per call (bounded by `MAX_INPUT_SIZE = 1024`);
+  call repeatedly for longer lists. A pool's **effective** list is capped at `QREWARDS_SNAPSHOT_CAP`
+  (16,384) — entries beyond that don't fit the per-epoch snapshot and aren't paid.
+- **`clearRecipients(poolId)`** — empties the list in O(1) by bumping `listVersion`; prior-version
+  entries are ignored by distribution and reclaimed on map cleanup/overwrite.
+
+If a list-mode pool has no eligible recipients at distribution time (empty/cleared list), its pot is
+simply retained and carries to the next epoch, same as a holdings pool with no eligible holders.
 
 **Hardcoded in `INITIALIZE` (no setters):** `platformOwner` (the QPay wallet — not a NULL
 first-caller bootstrap, and with **no transfer function**, so it is fixed for the life of the

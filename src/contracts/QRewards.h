@@ -38,7 +38,8 @@ constexpr uint32 QREWARDS_MAX_POOLS            = 1024;
 constexpr uint32 QREWARDS_MAX_ASSETS_PER_POOL  = 64;
 constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES   = 4;          // QU + up to 3 assets per pool
 constexpr uint32 QREWARDS_MAX_BATCH            = 16;         // assets per registerAssets call
-constexpr uint32 QREWARDS_MAX_AIRDROP          = 20;         // wallets per distributeToList call (MAX_INPUT_SIZE=1024)
+constexpr uint32 QREWARDS_MAX_RECIP_BATCH      = 24;         // recipients per addRecipients call (MAX_INPUT_SIZE=1024)
+constexpr uint64 QREWARDS_MAX_RECIPIENTS       = 131072;     // 2^17: shared recipient-list entries across all pools
 constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool routing entries for tagged QU transfers
 constexpr uint32 QREWARDS_PAGE                 = 256;        // page size for paginated views
 constexpr uint64 QREWARDS_SNAPSHOT_CAP         = 16384;      // 2^14: max unique holders per pool in one epoch snapshot
@@ -59,6 +60,9 @@ constexpr uint64 QREWARDS_CONTRACT_ASSET_NAME  = 19230739006837329ULL; // packed
 // Distribution modes (state.distributionMode):
 constexpr uint8  QREWARDS_DIST_END_EPOCH       = 0; // (default) distribute every pool in one END_EPOCH tick
 constexpr uint8  QREWARDS_DIST_STREAMED        = 1; // stream one pool at a time across END_TICKs over the epoch
+// Per-pool distribution target (PoolMeta.targetMode): who the pot is split among.
+constexpr uint8  QREWARDS_TARGET_HOLDINGS      = 0; // (default) live holders of the pool's registered assets
+constexpr uint8  QREWARDS_TARGET_LIST          = 1; // an explicit admin-uploaded recipient list (pro-rata by weight)
 // Streamed-mode pacing (fixed; no setter): ~24h delay before a cycle, batch per tick.
 constexpr uint32 QREWARDS_STREAM_DELAY_TICKS   = 86400;  // ~24h at ~1 tick/s: wait this many ticks into the epoch before a cycle
 constexpr uint32 QREWARDS_STREAM_BATCH         = 256;    // work units (freezes/payouts) per END_TICK
@@ -142,20 +146,34 @@ public:
         id     admin;
         uint64 label;             // short packed name (optional)
         uint64 operatingBalance;  // QU reserve for the per-epoch operating fee
-        uint64 lastTotalWeight;   // total holder weight at the last END_EPOCH distribution (for front ends)
+        uint64 lastTotalWeight;   // total weight at the last distribution (for front ends)
         uint32 numAssets;
         uint32 missedEpochs;      // consecutive epochs the operating fee could not be paid
+        uint32 listVersion;       // bumped by clearRecipients; only entries of the current version count
         uint8  numCurrencies;
         uint8  active;            // 1 = pool exists (0 after deactivation)
         uint8  paused;            // 1 = underfunded, not accruing/distributing
+        uint8  targetMode;        // 0 = by holdings (default), 1 = by explicit recipient list
         Array<DivCurrency, QREWARDS_MAX_DIV_CURRENCIES> currencies;
     };
 
-    // Composite key helper (excluded set).
+    // Composite key helper (excluded set + recipient list).
     struct KeyProto
     {
         uint64 poolId;
         id     wallet;
+    };
+
+    // One entry of a pool's explicit recipient list (used when targetMode == LIST). Keyed in the
+    // shared `recipients` map by K12(poolId, wallet); the value carries poolId/wallet/weight so the
+    // map can be filtered and enumerated by pool, and `version` lets clearRecipients invalidate a
+    // whole list in O(1) (stale-version entries are ignored and reclaimed on cleanup/overwrite).
+    struct RecipientEntry
+    {
+        id     wallet;
+        uint64 poolId;
+        uint64 weight;
+        uint32 version;
     };
 
     struct StateData
@@ -165,6 +183,8 @@ public:
         HashMap<id, uint8, QREWARDS_MAX_EXCLUSIONS> excluded;
         // Scratch holder->weight map, rebuilt per pool during END_EPOCH distribution.
         HashMap<id, uint64, QREWARDS_SNAPSHOT_CAP> snapshot;
+        // Explicit recipient lists for list-mode pools: key = K12(poolId, wallet) -> RecipientEntry.
+        HashMap<id, RecipientEntry, QREWARDS_MAX_RECIPIENTS> recipients;
         uint64 pendingDivFeeQU; // QU dividend-fee skim, flushed 80/20 at END_EPOCH
         Array<PoolMeta, QREWARDS_MAX_POOLS> poolMeta;
         Array<AssetRule, QREWARDS_REGISTRY_SIZE> registry;           // pool p asset i at p*MAX_ASSETS+i
@@ -414,12 +434,33 @@ protected:
         uint64 add;
         uint64 existing;
         uint64 stored;
+        sint64 ridx;
+        RecipientEntry rentry;
     };
     PRIVATE_PROCEDURE_WITH_LOCALS(SnapshotPool)
     {
         output.totalWeight = 0;
         state.mut().snapshot.reset();
         locals.meta = state.get().poolMeta.get(input.poolId);
+
+        // LIST mode: the "snapshot" is the admin's explicit recipient list (current version,
+        // weight > 0), not the live ledger. Each wallet appears once (deduped by key).
+        if (locals.meta.targetMode == QREWARDS_TARGET_LIST)
+        {
+            for (locals.ridx = state.get().recipients.nextElementIndex(NULL_INDEX);
+                 locals.ridx != NULL_INDEX;
+                 locals.ridx = state.get().recipients.nextElementIndex(locals.ridx))
+            {
+                locals.rentry = state.get().recipients.value(locals.ridx);
+                if (locals.rentry.poolId != input.poolId) continue;
+                if (locals.rentry.version != locals.meta.listVersion) continue;
+                if (locals.rentry.weight == 0) continue;
+                if (state.mut().snapshot.set(locals.rentry.wallet, locals.rentry.weight) != NULL_INDEX)
+                    output.totalWeight = output.totalWeight + (uint128)locals.rentry.weight;
+            }
+            return;
+        }
+
         locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
         for (locals.i = 0; locals.i < locals.meta.numAssets; locals.i++)
         {
@@ -492,7 +533,9 @@ protected:
     PRIVATE_PROCEDURE_WITH_LOCALS(DistributePool)
     {
         locals.meta = state.get().poolMeta.get(input.poolId);
-        if (!locals.meta.active || locals.meta.paused || locals.meta.numAssets == 0) return;
+        // (A list-mode pool may have no registered assets, so don't skip on numAssets==0;
+        //  an empty snapshot just yields totalWeight 0 and carries the pot.)
+        if (!locals.meta.active || locals.meta.paused) return;
 
         locals.spi.poolId = input.poolId;
         CALL(SnapshotPool, locals.spi, locals.spo);
@@ -578,8 +621,9 @@ protected:
             if (state.get().streamState == QREWARDS_STREAM_IDLE)
             {
                 // Start a pool: roll pot -> distributable, then freeze its snapshot (one unit).
+                // (A list-mode pool may have no registered assets; don't skip on numAssets==0.)
                 locals.meta = state.get().poolMeta.get(state.get().streamPoolCursor);
-                if (!locals.meta.active || locals.meta.paused || locals.meta.numAssets == 0)
+                if (!locals.meta.active || locals.meta.paused)
                 {
                     state.mut().streamPoolCursor = state.get().streamPoolCursor + 1;
                     continue;
@@ -874,88 +918,86 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // Admin-funded direct payout to an explicit wallet list (an "airdrop"), independent of the
-    // holdings-based dividend system. The pool admin supplies the funds in the same call:
-    //  - QU   (assetName==0 && issuer==NULL_ID): attach QU as the invocation reward; it must cover
-    //          the sum of `amounts`; each wallet gets amounts[i]; any leftover is refunded.
-    //  - token: the admin must have granted QREWARDS management of the asset; amounts are moved
-    //          directly from the admin to each wallet (nothing is pulled into the pool).
-    // Up to QREWARDS_MAX_AIRDROP wallets per call; call repeatedly for longer lists. This does not
-    // touch any pool pot or holder weights; `poolId` is only used to authorize the caller as admin.
-    struct distributeToList_input
+    // --- Explicit recipient-list distribution (targetMode == LIST) ---
+    // A pool admin can switch a pool to pay its dividends to an uploaded wallet list (pro-rata by
+    // weight, default equal) instead of to asset holders. The pot still accumulates from deposits
+    // and is distributed automatically each epoch by the normal engine; only the recipient set
+    // changes. The list is stored and built up in batches.
+
+    // Switch a pool between by-holdings (0, default) and by-list (1) distribution. Admin only.
+    struct setTargetMode_input { uint64 poolId; uint8 mode; };
+    struct setTargetMode_output { sint32 returnCode; };
+    struct setTargetMode_locals { PoolMeta meta; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(setTargetMode)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        locals.meta.targetMode = (input.mode == QREWARDS_TARGET_LIST) ? QREWARDS_TARGET_LIST : QREWARDS_TARGET_HOLDINGS;
+        state.mut().poolMeta.set(input.poolId, locals.meta);
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    // Add/update (weight > 0) or remove (weight == 0) recipients in a pool's list. For an equal
+    // split, pass the same weight (e.g. 1) for every wallet. Deduped by wallet; tagged with the
+    // pool's current listVersion. Up to QREWARDS_MAX_RECIP_BATCH per call; call repeatedly for
+    // longer lists. NOTE: a pool's effective list is capped at QREWARDS_SNAPSHOT_CAP (16,384) --
+    // beyond that, extra recipients are not paid (they don't fit the per-epoch snapshot).
+    struct addRecipients_input
     {
         uint64 poolId;
-        uint64 assetName;   // 0 = QU
-        id     issuer;      // NULL_ID for QU
         uint32 count;
-        Array<id, QREWARDS_MAX_AIRDROP>     wallets;
-        Array<uint64, QREWARDS_MAX_AIRDROP> amounts;
+        Array<id, QREWARDS_MAX_RECIP_BATCH>     wallets;
+        Array<uint64, QREWARDS_MAX_RECIP_BATCH> weights;
     };
-    struct distributeToList_output { sint32 returnCode; uint64 distributed; uint32 paid; };
-    struct distributeToList_locals { PoolMeta meta; uint32 n; uint32 i; uint64 total; uint64 amt; id w; uint64 refund; };
-    PUBLIC_PROCEDURE_WITH_LOCALS(distributeToList)
+    struct addRecipients_output { sint32 returnCode; uint32 added; };
+    struct addRecipients_locals { PoolMeta meta; uint32 n; uint32 i; id w; uint64 wt; KeyProto proto; id key; RecipientEntry e; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(addRecipients)
     {
-        output.distributed = 0;
-        output.paid = 0;
-        if (input.poolId >= state.get().numPools)
-        {
-            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-            output.returnCode = QREWARDS_POOL_NOT_FOUND;
-            return;
-        }
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        output.added = 0;
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
-        if (qpi.invocator() != locals.meta.admin)
-        {
-            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-            output.returnCode = QREWARDS_NOT_ADMIN;
-            return;
-        }
-
-        locals.n = (input.count > QREWARDS_MAX_AIRDROP) ? QREWARDS_MAX_AIRDROP : input.count;
-        locals.total = 0;
+        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        locals.n = (input.count > QREWARDS_MAX_RECIP_BATCH) ? QREWARDS_MAX_RECIP_BATCH : input.count;
         for (locals.i = 0; locals.i < locals.n; locals.i++)
-            locals.total = satAdd64(locals.total, input.amounts.get(locals.i));
+        {
+            locals.w = input.wallets.get(locals.i);
+            locals.wt = input.weights.get(locals.i);
+            setMemory(locals.proto, 0);
+            locals.proto.poolId = input.poolId;
+            locals.proto.wallet = locals.w;
+            locals.key = qpi.K12(locals.proto);
+            if (locals.wt == 0)
+            {
+                state.mut().recipients.removeByKey(locals.key); // weight 0 -> remove
+                continue;
+            }
+            setMemory(locals.e, 0);
+            locals.e.wallet = locals.w;
+            locals.e.poolId = input.poolId;
+            locals.e.weight = locals.wt;
+            locals.e.version = locals.meta.listVersion;
+            if (state.mut().recipients.set(locals.key, locals.e) != NULL_INDEX)
+                output.added++;
+        }
+        output.returnCode = QREWARDS_SUCCESS;
+    }
 
-        if (input.assetName == 0 && input.issuer == NULL_ID)
-        {
-            // QU airdrop: the attached reward must cover the full list.
-            if ((uint64)qpi.invocationReward() < locals.total)
-            {
-                if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-                output.returnCode = QREWARDS_INSUFFICIENT_FEE;
-                return;
-            }
-            for (locals.i = 0; locals.i < locals.n; locals.i++)
-            {
-                locals.amt = input.amounts.get(locals.i);
-                locals.w = input.wallets.get(locals.i);
-                if (locals.amt > 0 && qpi.transfer(locals.w, (sint64)locals.amt) >= 0)
-                {
-                    output.distributed += locals.amt;
-                    output.paid++;
-                }
-            }
-            // refund anything not sent (leftover + any entries that failed to send)
-            locals.refund = (uint64)qpi.invocationReward() - output.distributed;
-            if (locals.refund > 0) qpi.transfer(qpi.invocator(), (sint64)locals.refund);
-        }
-        else
-        {
-            // Token airdrop: refund any QU, move each amount from the admin to the wallet.
-            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-            for (locals.i = 0; locals.i < locals.n; locals.i++)
-            {
-                locals.amt = input.amounts.get(locals.i);
-                locals.w = input.wallets.get(locals.i);
-                if (locals.amt > 0
-                    && qpi.transferShareOwnershipAndPossession(input.assetName, input.issuer,
-                           qpi.invocator(), qpi.invocator(), (sint64)locals.amt, locals.w) >= 0)
-                {
-                    output.distributed += locals.amt;
-                    output.paid++;
-                }
-            }
-        }
+    // Clear a pool's entire recipient list in O(1) by bumping its listVersion; prior-version entries
+    // are ignored by distribution and reclaimed on map cleanup / overwrite.
+    struct clearRecipients_input { uint64 poolId; };
+    struct clearRecipients_output { sint32 returnCode; };
+    struct clearRecipients_locals { PoolMeta meta; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(clearRecipients)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        locals.meta.listVersion++;
+        state.mut().poolMeta.set(input.poolId, locals.meta);
         output.returnCode = QREWARDS_SUCCESS;
     }
 
@@ -1369,7 +1411,9 @@ public:
         REGISTER_USER_PROCEDURE(setFundingRoute, 12);
         REGISTER_USER_PROCEDURE(setExcludedAddress, 13);
         REGISTER_USER_PROCEDURE(setDistributionMode, 14);
-        REGISTER_USER_PROCEDURE(distributeToList, 15);
+        REGISTER_USER_PROCEDURE(setTargetMode, 15);
+        REGISTER_USER_PROCEDURE(addRecipients, 16);
+        REGISTER_USER_PROCEDURE(clearRecipients, 17);
     }
 
     INITIALIZE()

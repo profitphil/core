@@ -171,17 +171,32 @@ public:
         return output.returnCode;
     }
 
-    sint32 distributeToList(const id& caller, uint64 poolId, uint64 assetName, const id& issuer,
-                            uint32 count, const id* ws, const uint64* amts, uint64 reward,
-                            uint64& distributed, uint32& paid)
+    sint32 setTargetMode(const id& caller, uint64 poolId, uint8 mode)
     {
-        QREWARDS::distributeToList_input input;
+        QREWARDS::setTargetMode_input input{ poolId, mode };
+        QREWARDS::setTargetMode_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 15, input, output, caller, 0);
+        return output.returnCode;
+    }
+
+    sint32 addRecipients(const id& caller, uint64 poolId, uint32 count,
+                         const id* ws, const uint64* weights, uint32& added)
+    {
+        QREWARDS::addRecipients_input input;
         memset(&input, 0, sizeof(input));
-        input.poolId = poolId; input.assetName = assetName; input.issuer = issuer; input.count = count;
-        for (uint32 i = 0; i < count; i++) { input.wallets.set(i, ws[i]); input.amounts.set(i, amts[i]); }
-        QREWARDS::distributeToList_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 15, input, output, caller, (sint64)reward);
-        distributed = output.distributed; paid = output.paid;
+        input.poolId = poolId; input.count = count;
+        for (uint32 i = 0; i < count; i++) { input.wallets.set(i, ws[i]); input.weights.set(i, weights[i]); }
+        QREWARDS::addRecipients_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 16, input, output, caller, 0);
+        added = output.added;
+        return output.returnCode;
+    }
+
+    sint32 clearRecipients(const id& caller, uint64 poolId)
+    {
+        QREWARDS::clearRecipients_input input{ poolId };
+        QREWARDS::clearRecipients_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 17, input, output, caller, 0);
         return output.returnCode;
     }
 
@@ -720,32 +735,79 @@ TEST(ContractQRewards, StreamedDistributionAcrossTicks)
     EXPECT_EQ(t.getState()->poolDistributable(pool, 0), 0u);
 }
 
-// Admin uploads an arbitrary wallet list and airdrops QU to it (admin-funded, per-wallet amounts).
-TEST(ContractQRewards, DistributeToListQu)
+// List-mode pool: admin uploads a weighted recipient list; the pot is distributed pro-rata to that
+// list each epoch (no assets, no holder lookup). No QU is attached per wallet -- it comes from the pot.
+TEST(ContractQRewards, ListModeDistribution)
 {
     ContractTestingQRewards t;
     increaseEnergy(QR_ADMIN, 10000000000ULL);
-    increaseEnergy(QR_BOB, 5000000000ULL);
+    increaseEnergy(QR_FUND, 5000000000ULL);
 
+    t.disableOperatingFee();
     uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
 
+    // Switch to list mode and upload three recipients: weights 1, 1, 2 (total 4).
+    EXPECT_EQ(t.setTargetMode(QR_ADMIN, pool, QREWARDS_TARGET_LIST), QREWARDS_SUCCESS);
     const id ws[3] = { QR_ALICE, QR_BOB, QR_FUND };
-    const uint64 amts[3] = { 1000ULL, 2000ULL, 3000ULL }; // total 6000
+    const uint64 wts[3] = { 1ULL, 1ULL, 2ULL };
+    uint32 added = 0;
+    EXPECT_EQ(t.addRecipients(QR_ADMIN, pool, 3, ws, wts, added), QREWARDS_SUCCESS);
+    EXPECT_EQ(added, 3u);
+
+    t.depositQU(QR_FUND, pool, 10000ULL); // pot 9500
     long long a0 = getBalance(QR_ALICE), b0 = getBalance(QR_BOB), f0 = getBalance(QR_FUND);
-    long long adminBefore = getBalance(QR_ADMIN);
 
-    uint64 dist = 0; uint32 paid = 0;
-    // Attach 10,000 QU; 6,000 distributed, 4,000 refunded.
-    EXPECT_EQ(t.distributeToList(QR_ADMIN, pool, 0ULL, NULL_ID, 3, ws, amts, 10000ULL, dist, paid), QREWARDS_SUCCESS);
-    EXPECT_EQ(dist, 6000u);
-    EXPECT_EQ(paid, 3u);
-    EXPECT_EQ(getBalance(QR_ALICE) - a0, 1000LL);
-    EXPECT_EQ(getBalance(QR_BOB) - b0, 2000LL);
-    EXPECT_EQ(getBalance(QR_FUND) - f0, 3000LL);
-    EXPECT_EQ(getBalance(QR_ADMIN) - adminBefore, -6000LL); // paid 10k, refunded 4k
+    t.endEpoch();
+    // pot 9500 over total weight 4: Alice 1/4 = 2375, Bob 1/4 = 2375, Fund 2/4 = 4750.
+    EXPECT_EQ(getBalance(QR_ALICE) - a0, 2375LL);
+    EXPECT_EQ(getBalance(QR_BOB) - b0, 2375LL);
+    EXPECT_EQ(getBalance(QR_FUND) - f0, 4750LL);
+    EXPECT_EQ(t.getState()->poolPot(pool, 0), 0u);
+}
 
-    // A non-admin cannot airdrop from this pool; the attached QU is refunded.
-    long long b1 = getBalance(QR_BOB);
-    EXPECT_EQ(t.distributeToList(QR_BOB, pool, 0ULL, NULL_ID, 1, ws, amts, 1000ULL, dist, paid), QREWARDS_NOT_ADMIN);
-    EXPECT_EQ(getBalance(QR_BOB) - b1, 0LL); // reward refunded, nothing sent
+// addRecipients with weight 0 removes an entry; clearRecipients invalidates the whole list; and
+// only the pool admin may manage the list.
+TEST(ContractQRewards, ListModeEditAndAuth)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_FUND, 5000000000ULL);
+
+    t.disableOperatingFee();
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+    EXPECT_EQ(t.setTargetMode(QR_ADMIN, pool, QREWARDS_TARGET_LIST), QREWARDS_SUCCESS);
+
+    // A non-admin cannot set the mode or the list.
+    uint32 added = 0;
+    const id one[1] = { QR_ALICE };
+    const uint64 onew[1] = { 1ULL };
+    EXPECT_EQ(t.setTargetMode(QR_BOB, pool, QREWARDS_TARGET_LIST), QREWARDS_NOT_ADMIN);
+    EXPECT_EQ(t.addRecipients(QR_BOB, pool, 1, one, onew, added), QREWARDS_NOT_ADMIN);
+    EXPECT_EQ(t.clearRecipients(QR_BOB, pool), QREWARDS_NOT_ADMIN);
+
+    // Equal split across Alice and Bob (weight 1 each).
+    const id ws[2] = { QR_ALICE, QR_BOB };
+    const uint64 wts[2] = { 1ULL, 1ULL };
+    EXPECT_EQ(t.addRecipients(QR_ADMIN, pool, 2, ws, wts, added), QREWARDS_SUCCESS);
+    EXPECT_EQ(added, 2u);
+
+    // Remove Bob (weight 0); only Alice remains and takes the whole pot.
+    const id bob[1] = { QR_BOB };
+    const uint64 zero[1] = { 0ULL };
+    EXPECT_EQ(t.addRecipients(QR_ADMIN, pool, 1, bob, zero, added), QREWARDS_SUCCESS);
+
+    t.depositQU(QR_FUND, pool, 10000ULL); // pot 9500
+    long long a0 = getBalance(QR_ALICE), b0 = getBalance(QR_BOB);
+    t.endEpoch();
+    EXPECT_EQ(getBalance(QR_ALICE) - a0, 9500LL); // sole recipient
+    EXPECT_EQ(getBalance(QR_BOB) - b0, 0LL);      // removed
+    EXPECT_EQ(t.getState()->poolPot(pool, 0), 0u);
+
+    // clearRecipients empties the list: a later deposit has no recipients and the pot carries over.
+    EXPECT_EQ(t.clearRecipients(QR_ADMIN, pool), QREWARDS_SUCCESS);
+    t.depositQU(QR_FUND, pool, 10000ULL); // pot 9500
+    long long a1 = getBalance(QR_ALICE);
+    t.endEpoch();
+    EXPECT_EQ(getBalance(QR_ALICE) - a1, 0LL);        // nobody to pay
+    EXPECT_EQ(t.getState()->poolPot(pool, 0), 9500u); // pot retained
 }
