@@ -171,6 +171,20 @@ public:
         return output.returnCode;
     }
 
+    sint32 distributeToList(const id& caller, uint64 poolId, uint64 assetName, const id& issuer,
+                            uint32 count, const id* ws, const uint64* amts, uint64 reward,
+                            uint64& distributed, uint32& paid)
+    {
+        QREWARDS::distributeToList_input input;
+        memset(&input, 0, sizeof(input));
+        input.poolId = poolId; input.assetName = assetName; input.issuer = issuer; input.count = count;
+        for (uint32 i = 0; i < count; i++) { input.wallets.set(i, ws[i]); input.amounts.set(i, amts[i]); }
+        QREWARDS::distributeToList_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 15, input, output, caller, (sint64)reward);
+        distributed = output.distributed; paid = output.paid;
+        return output.returnCode;
+    }
+
     void endEpoch()
     {
         callSystemProcedure(QREWARDS_CONTRACT_INDEX, END_EPOCH);
@@ -704,4 +718,34 @@ TEST(ContractQRewards, StreamedDistributionAcrossTicks)
     EXPECT_EQ(getBalance(QR_BOB) - b0, 4750LL);
     EXPECT_EQ(t.getState()->poolPot(pool, 0), 0u);
     EXPECT_EQ(t.getState()->poolDistributable(pool, 0), 0u);
+}
+
+// Admin uploads an arbitrary wallet list and airdrops QU to it (admin-funded, per-wallet amounts).
+TEST(ContractQRewards, DistributeToListQu)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_BOB, 5000000000ULL);
+
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+
+    const id ws[3] = { QR_ALICE, QR_BOB, QR_FUND };
+    const uint64 amts[3] = { 1000ULL, 2000ULL, 3000ULL }; // total 6000
+    long long a0 = getBalance(QR_ALICE), b0 = getBalance(QR_BOB), f0 = getBalance(QR_FUND);
+    long long adminBefore = getBalance(QR_ADMIN);
+
+    uint64 dist = 0; uint32 paid = 0;
+    // Attach 10,000 QU; 6,000 distributed, 4,000 refunded.
+    EXPECT_EQ(t.distributeToList(QR_ADMIN, pool, 0ULL, NULL_ID, 3, ws, amts, 10000ULL, dist, paid), QREWARDS_SUCCESS);
+    EXPECT_EQ(dist, 6000u);
+    EXPECT_EQ(paid, 3u);
+    EXPECT_EQ(getBalance(QR_ALICE) - a0, 1000LL);
+    EXPECT_EQ(getBalance(QR_BOB) - b0, 2000LL);
+    EXPECT_EQ(getBalance(QR_FUND) - f0, 3000LL);
+    EXPECT_EQ(getBalance(QR_ADMIN) - adminBefore, -6000LL); // paid 10k, refunded 4k
+
+    // A non-admin cannot airdrop from this pool; the attached QU is refunded.
+    long long b1 = getBalance(QR_BOB);
+    EXPECT_EQ(t.distributeToList(QR_BOB, pool, 0ULL, NULL_ID, 1, ws, amts, 1000ULL, dist, paid), QREWARDS_NOT_ADMIN);
+    EXPECT_EQ(getBalance(QR_BOB) - b1, 0LL); // reward refunded, nothing sent
 }

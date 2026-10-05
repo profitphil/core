@@ -38,6 +38,7 @@ constexpr uint32 QREWARDS_MAX_POOLS            = 1024;
 constexpr uint32 QREWARDS_MAX_ASSETS_PER_POOL  = 64;
 constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES   = 4;          // QU + up to 3 assets per pool
 constexpr uint32 QREWARDS_MAX_BATCH            = 16;         // assets per registerAssets call
+constexpr uint32 QREWARDS_MAX_AIRDROP          = 20;         // wallets per distributeToList call (MAX_INPUT_SIZE=1024)
 constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool routing entries for tagged QU transfers
 constexpr uint32 QREWARDS_PAGE                 = 256;        // page size for paginated views
 constexpr uint64 QREWARDS_SNAPSHOT_CAP         = 16384;      // 2^14: max unique holders per pool in one epoch snapshot
@@ -873,6 +874,91 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
+    // Admin-funded direct payout to an explicit wallet list (an "airdrop"), independent of the
+    // holdings-based dividend system. The pool admin supplies the funds in the same call:
+    //  - QU   (assetName==0 && issuer==NULL_ID): attach QU as the invocation reward; it must cover
+    //          the sum of `amounts`; each wallet gets amounts[i]; any leftover is refunded.
+    //  - token: the admin must have granted QREWARDS management of the asset; amounts are moved
+    //          directly from the admin to each wallet (nothing is pulled into the pool).
+    // Up to QREWARDS_MAX_AIRDROP wallets per call; call repeatedly for longer lists. This does not
+    // touch any pool pot or holder weights; `poolId` is only used to authorize the caller as admin.
+    struct distributeToList_input
+    {
+        uint64 poolId;
+        uint64 assetName;   // 0 = QU
+        id     issuer;      // NULL_ID for QU
+        uint32 count;
+        Array<id, QREWARDS_MAX_AIRDROP>     wallets;
+        Array<uint64, QREWARDS_MAX_AIRDROP> amounts;
+    };
+    struct distributeToList_output { sint32 returnCode; uint64 distributed; uint32 paid; };
+    struct distributeToList_locals { PoolMeta meta; uint32 n; uint32 i; uint64 total; uint64 amt; id w; uint64 refund; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(distributeToList)
+    {
+        output.distributed = 0;
+        output.paid = 0;
+        if (input.poolId >= state.get().numPools)
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_POOL_NOT_FOUND;
+            return;
+        }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (qpi.invocator() != locals.meta.admin)
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_NOT_ADMIN;
+            return;
+        }
+
+        locals.n = (input.count > QREWARDS_MAX_AIRDROP) ? QREWARDS_MAX_AIRDROP : input.count;
+        locals.total = 0;
+        for (locals.i = 0; locals.i < locals.n; locals.i++)
+            locals.total = satAdd64(locals.total, input.amounts.get(locals.i));
+
+        if (input.assetName == 0 && input.issuer == NULL_ID)
+        {
+            // QU airdrop: the attached reward must cover the full list.
+            if ((uint64)qpi.invocationReward() < locals.total)
+            {
+                if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                output.returnCode = QREWARDS_INSUFFICIENT_FEE;
+                return;
+            }
+            for (locals.i = 0; locals.i < locals.n; locals.i++)
+            {
+                locals.amt = input.amounts.get(locals.i);
+                locals.w = input.wallets.get(locals.i);
+                if (locals.amt > 0 && qpi.transfer(locals.w, (sint64)locals.amt) >= 0)
+                {
+                    output.distributed += locals.amt;
+                    output.paid++;
+                }
+            }
+            // refund anything not sent (leftover + any entries that failed to send)
+            locals.refund = (uint64)qpi.invocationReward() - output.distributed;
+            if (locals.refund > 0) qpi.transfer(qpi.invocator(), (sint64)locals.refund);
+        }
+        else
+        {
+            // Token airdrop: refund any QU, move each amount from the admin to the wallet.
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            for (locals.i = 0; locals.i < locals.n; locals.i++)
+            {
+                locals.amt = input.amounts.get(locals.i);
+                locals.w = input.wallets.get(locals.i);
+                if (locals.amt > 0
+                    && qpi.transferShareOwnershipAndPossession(input.assetName, input.issuer,
+                           qpi.invocator(), qpi.invocator(), (sint64)locals.amt, locals.w) >= 0)
+                {
+                    output.distributed += locals.amt;
+                    output.paid++;
+                }
+            }
+        }
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
     // Deposit a dividend into one pool/currency. Added to the currency's pot and paid
     // to live holders at END_EPOCH.
     //  - QU currency (slot where assetName==0): QU is taken from the invocation reward.
@@ -1283,6 +1369,7 @@ public:
         REGISTER_USER_PROCEDURE(setFundingRoute, 12);
         REGISTER_USER_PROCEDURE(setExcludedAddress, 13);
         REGISTER_USER_PROCEDURE(setDistributionMode, 14);
+        REGISTER_USER_PROCEDURE(distributeToList, 15);
     }
 
     INITIALIZE()

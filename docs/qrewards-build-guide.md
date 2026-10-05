@@ -201,7 +201,15 @@ The per-share flooring in the token shareholder leg means it only pays out once 
 **Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)`
 · `setPoolAdmin(5)` · `depositDividend(6)` · `depositOperating(7)` · `setPlatformParams(8)` (owner)
 · `TransferShareManagementRights(9)` · `registerAssets(10)` (batch, ≤16) · `addDividendCurrency(11)`
-· `setFundingRoute(12)` · `setExcludedAddress(13)` (pool admin) · `setDistributionMode(14)` (owner).
+· `setFundingRoute(12)` · `setExcludedAddress(13)` (pool admin) · `setDistributionMode(14)` (owner)
+· `distributeToList(15)` (pool admin).
+
+**`distributeToList` (admin airdrop):** a pool admin can pay an **explicit list of wallets** directly,
+independent of the holdings-based dividends. The admin funds it in the same call — QU as the attached
+reward (must cover the sum of `amounts`; leftover refunded), or a token the admin has granted QREWARDS
+to manage (moved straight from the admin to each wallet). Up to `QREWARDS_MAX_AIRDROP` (20) wallets per
+call (bounded by `MAX_INPUT_SIZE = 1024`); call repeatedly for longer lists. It never touches any pool
+pot or holder weights — `poolId` is used only to authorize the caller as that pool's admin.
 
 **Hardcoded in `INITIALIZE` (no setters):** `platformOwner` (the QPay wallet — not a NULL
 first-caller bootstrap, and with **no transfer function**, so it is fixed for the life of the
