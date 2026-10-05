@@ -40,7 +40,9 @@ constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES   = 4;          // QU + up to 3 ass
 constexpr uint32 QREWARDS_MAX_BATCH            = 16;         // assets per registerAssets call
 constexpr uint32 QREWARDS_MAX_RECIP_BATCH      = 24;         // recipients per addRecipients call (MAX_INPUT_SIZE=1024)
 constexpr uint64 QREWARDS_MAX_RECIPIENTS       = 1048576;    // 2^20: shared recipient-list entries across ALL pools
-                                                            // (~96MB of the 1GB state budget; per-pool effective cap is still SNAPSHOT_CAP)
+                                                            // (~96MB of the 1GB state budget; ~209 pools at the per-pool cap)
+constexpr uint32 QREWARDS_MAX_LIST_PER_POOL    = 5000;      // hard cap on list-mode recipients per pool (< SNAPSHOT_CAP,
+                                                            // so every recipient in a list pool is always paid in full each epoch)
 constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool routing entries for tagged QU transfers
 constexpr uint32 QREWARDS_PAGE                 = 256;        // page size for paginated views
 constexpr uint64 QREWARDS_SNAPSHOT_CAP         = 16384;      // 2^14: max unique holders per pool in one epoch snapshot
@@ -153,6 +155,7 @@ public:
         uint32 numAssets;
         uint32 missedEpochs;      // consecutive epochs the operating fee could not be paid
         uint32 listVersion;       // bumped by clearRecipients; only entries of the current version count
+        uint32 listCount;         // live recipient-list entries for this pool (enforces QREWARDS_MAX_LIST_PER_POOL)
         uint8  numCurrencies;
         uint8  active;            // 1 = pool exists (0 after deactivation)
         uint8  paused;            // 1 = underfunded, not accruing/distributing
@@ -960,8 +963,10 @@ public:
     // Add/update (weight > 0) or remove (weight == 0) recipients in a pool's list. For an equal
     // split, pass the same weight (e.g. 1) for every wallet. Deduped by wallet; tagged with the
     // pool's current listVersion. Up to QREWARDS_MAX_RECIP_BATCH per call; call repeatedly for
-    // longer lists. NOTE: a pool's effective list is capped at QREWARDS_SNAPSHOT_CAP (16,384) --
-    // beyond that, extra recipients are not paid (they don't fit the per-epoch snapshot).
+    // longer lists. A pool's list is hard-capped at QREWARDS_MAX_LIST_PER_POOL (5,000): once full,
+    // further NEW wallets are skipped (output.added < count), but existing entries can still be
+    // updated or removed. Since the cap is below QREWARDS_SNAPSHOT_CAP, every listed recipient is
+    // always paid in full each epoch (nobody is truncated).
     struct addRecipients_input
     {
         uint64 poolId;
@@ -969,12 +974,13 @@ public:
         Array<id, QREWARDS_MAX_RECIP_BATCH>     wallets;
         Array<uint64, QREWARDS_MAX_RECIP_BATCH> weights;
     };
-    struct addRecipients_output { sint32 returnCode; uint32 added; };
-    struct addRecipients_locals { PoolMeta meta; uint32 n; uint32 i; id w; uint64 wt; KeyProto proto; id key; RecipientEntry e; };
+    struct addRecipients_output { sint32 returnCode; uint32 added; uint32 rejected; uint32 listCount; };
+    struct addRecipients_locals { PoolMeta meta; uint32 n; uint32 i; id w; uint64 wt; KeyProto proto; id key; RecipientEntry e; bit existed; };
     PUBLIC_PROCEDURE_WITH_LOCALS(addRecipients)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         output.added = 0;
+        output.rejected = 0;
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
@@ -990,9 +996,20 @@ public:
             locals.proto.poolId = input.poolId;
             locals.proto.wallet = locals.w;
             locals.key = qpi.K12(locals.proto);
+            locals.existed = state.get().recipients.contains(locals.key);
             if (locals.wt == 0)
             {
-                state.mut().recipients.removeByKey(locals.key); // weight 0 -> remove
+                if (locals.existed)
+                {
+                    state.mut().recipients.removeByKey(locals.key); // weight 0 -> remove
+                    if (locals.meta.listCount > 0) locals.meta.listCount--;
+                }
+                continue;
+            }
+            // Enforce the per-pool cap on NEW wallets only (updates to existing entries are fine).
+            if (!locals.existed && locals.meta.listCount >= QREWARDS_MAX_LIST_PER_POOL)
+            {
+                output.rejected++;
                 continue;
             }
             setMemory(locals.e, 0);
@@ -1001,8 +1018,17 @@ public:
             locals.e.weight = locals.wt;
             locals.e.version = locals.meta.listVersion;
             if (state.mut().recipients.set(locals.key, locals.e) != NULL_INDEX)
+            {
+                if (!locals.existed) locals.meta.listCount++;
                 output.added++;
+            }
+            else
+            {
+                output.rejected++; // shared map globally full
+            }
         }
+        state.mut().poolMeta.set(input.poolId, locals.meta);
+        output.listCount = locals.meta.listCount;
         output.returnCode = QREWARDS_SUCCESS;
     }
 
@@ -1032,6 +1058,7 @@ public:
         }
         state.mut().recipients.cleanupIfNeeded();
         locals.meta.listVersion++;
+        locals.meta.listCount = 0; // list emptied
         state.mut().poolMeta.set(input.poolId, locals.meta);
         output.returnCode = QREWARDS_SUCCESS;
     }
