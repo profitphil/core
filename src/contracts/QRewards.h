@@ -58,7 +58,7 @@ constexpr uint64 QREWARDS_CONTRACT_ASSET_NAME  = 19230739006837329ULL; // packed
 // Distribution modes (state.distributionMode):
 constexpr uint8  QREWARDS_DIST_END_EPOCH       = 0; // (default) distribute every pool in one END_EPOCH tick
 constexpr uint8  QREWARDS_DIST_STREAMED        = 1; // stream one pool at a time across END_TICKs over the epoch
-// Streamed-mode defaults (protocol-owner tunable via setStreamParams):
+// Streamed-mode pacing (fixed; no setter): ~24h delay before a cycle, batch per tick.
 constexpr uint32 QREWARDS_STREAM_DELAY_TICKS   = 86400;  // ~24h at ~1 tick/s: wait this many ticks into the epoch before a cycle
 constexpr uint32 QREWARDS_STREAM_BATCH         = 256;    // work units (freezes/payouts) per END_TICK
 constexpr uint16 QREWARDS_NO_CYCLE_EPOCH       = 0xFFFF; // sentinel: no cycle has run yet
@@ -994,25 +994,8 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    struct setQpayhubAddress_input { id qpayhubAddress; };
-    struct setQpayhubAddress_output { sint32 returnCode; };
-    PUBLIC_PROCEDURE(setQpayhubAddress)
-    {
-        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-        if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
-        state.mut().qpayhubAddress = input.qpayhubAddress;
-        output.returnCode = QREWARDS_SUCCESS;
-    }
-
-    struct setQpayTokenDividendsAddress_input { id addr; };
-    struct setQpayTokenDividendsAddress_output { sint32 returnCode; };
-    PUBLIC_PROCEDURE(setQpayTokenDividendsAddress)
-    {
-        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-        if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
-        state.mut().qpayTokenDividendsAddress = input.addr;
-        output.returnCode = QREWARDS_SUCCESS;
-    }
+    // Fee destinations (qpayhubAddress, qpayTokenDividendsAddress) are hardcoded in INITIALIZE
+    // and intentionally have no setters, so they can never be repointed after deployment.
 
     struct setPlatformOwner_input { id newOwner; };
     struct setPlatformOwner_output { sint32 returnCode; };
@@ -1071,7 +1054,8 @@ public:
     }
 
     // Protocol owner: switch distribution between END_EPOCH (0, default) and streamed (1).
-    // Takes effect from the next cycle; an in-progress streamed cycle finishes first.
+    // Takes effect from the next cycle; an in-progress streamed cycle finishes first. The
+    // streamed 24h delay and batch size are fixed (QREWARDS_STREAM_DELAY_TICKS / _BATCH).
     struct setDistributionMode_input { uint8 mode; };
     struct setDistributionMode_output { sint32 returnCode; };
     PUBLIC_PROCEDURE(setDistributionMode)
@@ -1079,19 +1063,6 @@ public:
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
         state.mut().distributionMode = (input.mode == QREWARDS_DIST_STREAMED) ? QREWARDS_DIST_STREAMED : QREWARDS_DIST_END_EPOCH;
-        output.returnCode = QREWARDS_SUCCESS;
-    }
-
-    // Protocol owner: tune streamed-mode pacing. delayTicks = ticks into the epoch before a
-    // cycle starts; batchSize = work units (freezes/payouts) per tick (clamped to >=1).
-    struct setStreamParams_input { uint32 delayTicks; uint32 batchSize; };
-    struct setStreamParams_output { sint32 returnCode; };
-    PUBLIC_PROCEDURE(setStreamParams)
-    {
-        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-        if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
-        state.mut().streamDelayTicks = input.delayTicks;
-        state.mut().streamBatchSize = (input.batchSize == 0) ? 1 : input.batchSize;
         output.returnCode = QREWARDS_SUCCESS;
     }
 
@@ -1298,11 +1269,8 @@ public:
         REGISTER_USER_PROCEDURE(registerAssets, 11);
         REGISTER_USER_PROCEDURE(addDividendCurrency, 12);
         REGISTER_USER_PROCEDURE(setFundingRoute, 13);
-        REGISTER_USER_PROCEDURE(setQpayhubAddress, 14);
-        REGISTER_USER_PROCEDURE(setExcludedAddress, 15);
-        REGISTER_USER_PROCEDURE(setQpayTokenDividendsAddress, 16);
-        REGISTER_USER_PROCEDURE(setDistributionMode, 17);
-        REGISTER_USER_PROCEDURE(setStreamParams, 18);
+        REGISTER_USER_PROCEDURE(setExcludedAddress, 14);
+        REGISTER_USER_PROCEDURE(setDistributionMode, 15);
     }
 
     INITIALIZE()
@@ -1318,8 +1286,8 @@ public:
         state.mut().qpayhubAddress = id(29, 0, 0, 0);
         // Destination for the 80% leg of the 5% TOKEN dividend fee: the QRaffle charity
         // address (DPQRLSZSSCXIYFIQGBFBXXISDDEBEGQNWNTQUEIFSCUWGHVXJPLFGMYD...), a plain
-        // wallet that simply receives the tokens. (The 20% shareholder leg is unchanged.)
-        // Owner-tunable via setQpayTokenDividendsAddress.
+        // wallet that simply receives the tokens. Hardcoded, no setter (immutable).
+        // (The 20% shareholder leg is unchanged.)
         state.mut().qpayTokenDividendsAddress = ID(_D, _P, _Q, _R, _L, _S, _Z, _S, _S, _C, _X, _I, _Y, _F, _I, _Q, _G, _B, _F, _B, _X, _X, _I, _S, _D, _D, _E, _B, _E, _G, _Q, _N, _W, _N, _T, _Q, _U, _E, _I, _F, _S, _C, _U, _W, _G, _H, _V, _X, _J, _P, _L, _F, _G, _M, _Y, _D);
         state.mut().createPoolFee = QREWARDS_DEFAULT_CREATE_FEE;
         state.mut().operatingFee = QREWARDS_DEFAULT_OPERATING_FEE;

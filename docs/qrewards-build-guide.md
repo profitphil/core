@@ -140,9 +140,9 @@ to many pools / large holder counts. It is **off by default** (`distributionMode
 paths ship, and the protocol owner flips it on with one transaction — **no redeploy**:
 
 - `setDistributionMode(1)` → streamed; `setDistributionMode(0)` → back to END_EPOCH.
-- `setStreamParams(delayTicks, batchSize)` → how long to wait into the epoch before a cycle starts
-  (default `QREWARDS_STREAM_DELAY_TICKS ≈ 24h`), and how many work units to do per tick
-  (`QREWARDS_STREAM_BATCH`). `getPlatform` reports mode, params, and whether a cycle is active.
+- The start delay (`QREWARDS_STREAM_DELAY_TICKS ≈ 24h`) and per-tick batch (`QREWARDS_STREAM_BATCH`)
+  are **fixed constants** — there is no setter to change them. `getPlatform` reports the mode, the
+  fixed params, and whether a cycle is active.
 
 **How it runs** (`END_TICK`, once `delayTicks` into the epoch, once per epoch):
 a cycle walks pools in order via a persisted cursor. For each pool it (1) rolls `pot → distributable`
@@ -193,11 +193,16 @@ The per-share flooring in the token shareholder leg means it only pays out once 
 
 **Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)`
 · `setPoolAdmin(5)` · `depositDividend(6)` · `depositOperating(7)` · `setPlatformParams(8)` (owner)
-· `setPlatformOwner(9)` (first caller claims it from NULL) · `TransferShareManagementRights(10)`
+· `setPlatformOwner(9)` (owner, key rotation) · `TransferShareManagementRights(10)`
 · `registerAssets(11)` (batch, ≤16) · `addDividendCurrency(12)` · `setFundingRoute(13)`
-· `setQpayhubAddress(14)` (owner) · `setExcludedAddress(15)` (pool admin) ·
-`setQpayTokenDividendsAddress(16)` (owner) · `setDistributionMode(17)` (owner) ·
-`setStreamParams(18)` (owner).
+· `setExcludedAddress(14)` (pool admin) · `setDistributionMode(15)` (owner).
+
+**Hardcoded in `INITIALIZE` (no setters):** `platformOwner` (set to the real owner identity — not a
+NULL first-caller bootstrap), `qpayhubAddress = id(29,0,0,0)`, and `qpayTokenDividendsAddress` (the
+QRaffle charity wallet). The streamed delay (~24h) and batch size are fixed constants. The **only**
+owner-only functions are `setPlatformParams` (fees), `setDistributionMode` (END_EPOCH ⇄ streamed
+switch), and `setPlatformOwner` (key rotation) — the fee-destination and stream-pacing setters were
+removed so those values can never be repointed after deployment.
 
 **Functions** (index): `getPool(1)` (admin, label, operatingBalance, `lastTotalWeight`, counts,
 active/paused, and per-currency `assetName`/`pot`/`lifetime`) · `getPoolAsset(2)` ·

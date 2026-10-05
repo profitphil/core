@@ -17,7 +17,6 @@ static const id QR_ADMIN = qrUser(100);
 static const id QR_ALICE = qrUser(1);
 static const id QR_BOB   = qrUser(2);
 static const id QR_CAROL = qrUser(3); // QREWARDS shareholder (contract shares)
-static const id QR_HUB   = qrUser(4); // stands in for the QPAYHUB dividends account
 static const id QR_FUND  = qrUser(5); // neutral depositor (never a pool holder)
 static const uint64 QR_TOKEN = 123456789ULL; // reward-earning asset
 static const uint64 QR_DOGE  = 987654321ULL; // a dividend-currency asset
@@ -156,14 +155,6 @@ public:
         return output.returnCode;
     }
 
-    sint32 setPlatformOwner(const id& caller, const id& newOwner)
-    {
-        QREWARDS::setPlatformOwner_input input{ newOwner };
-        QREWARDS::setPlatformOwner_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 9, input, output, caller, 0);
-        return output.returnCode;
-    }
-
     sint32 setFundingRoute(const id& caller, uint64 poolId, bit clear)
     {
         QREWARDS::setFundingRoute_input input{ poolId, clear };
@@ -172,19 +163,11 @@ public:
         return output.returnCode;
     }
 
-    sint32 setQpayhubAddr(const id& caller, const id& addr)
-    {
-        QREWARDS::setQpayhubAddress_input input{ addr };
-        QREWARDS::setQpayhubAddress_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 14, input, output, caller, 0);
-        return output.returnCode;
-    }
-
     sint32 setExcluded(const id& caller, uint64 poolId, const id& address, bit excluded)
     {
         QREWARDS::setExcludedAddress_input input{ poolId, address, excluded };
         QREWARDS::setExcludedAddress_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 15, input, output, caller, 0);
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 14, input, output, caller, 0);
         return output.returnCode;
     }
 
@@ -207,25 +190,21 @@ public:
     {
         QREWARDS::setDistributionMode_input input{ mode };
         QREWARDS::setDistributionMode_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 17, input, output, caller, 0);
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 15, input, output, caller, 0);
         return output.returnCode;
     }
 
-    sint32 setStreamParams(const id& caller, uint32 delayTicks, uint32 batchSize)
-    {
-        QREWARDS::setStreamParams_input input{ delayTicks, batchSize };
-        QREWARDS::setStreamParams_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 18, input, output, caller, 0);
-        return output.returnCode;
-    }
+    // platformOwner is hardcoded in INITIALIZE (no bootstrap), so tests set it directly.
+    void becomeOwner() { getState()->platformOwner = QR_ADMIN; }
 
-    // Enable streamed mode with no start delay and a given batch size (owner = QR_ADMIN).
+    // Enable streamed mode (owner = QR_ADMIN) with a given batch size. The 24h delay is fixed in
+    // the contract, so streamed tests advance system.tick past it to trigger a cycle.
     void enableStreamed(uint32 batchSize)
     {
-        EXPECT_EQ(setPlatformOwner(QR_ADMIN, QR_ADMIN), QREWARDS_SUCCESS);
+        becomeOwner();
         EXPECT_EQ(setPlatformParams(QR_ADMIN, QREWARDS_DEFAULT_CREATE_FEE, 0ULL), QREWARDS_SUCCESS); // no operating fee
         EXPECT_EQ(setDistributionMode(QR_ADMIN, QREWARDS_DIST_STREAMED), QREWARDS_SUCCESS);
-        EXPECT_EQ(setStreamParams(QR_ADMIN, 0u, batchSize), QREWARDS_SUCCESS);
+        getState()->streamBatchSize = batchSize;
     }
 
     // Simulate a plain (standard) QU transfer landing on the contract address, which the
@@ -300,7 +279,7 @@ public:
     // are not perturbed by pool pausing.
     void disableOperatingFee()
     {
-        EXPECT_EQ(setPlatformOwner(QR_ADMIN, QR_ADMIN), QREWARDS_SUCCESS);
+        becomeOwner();
         EXPECT_EQ(setPlatformParams(QR_ADMIN, QREWARDS_DEFAULT_CREATE_FEE, 0ULL), QREWARDS_SUCCESS);
     }
 };
@@ -500,25 +479,26 @@ TEST(ContractQRewards, QuDividendFeeRouting)
     increaseEnergy(QR_ALICE, 5000000000ULL);
     increaseEnergy(QR_FUND, 5000000000ULL);
 
-    EXPECT_EQ(t.setPlatformOwner(QR_ADMIN, QR_ADMIN), QREWARDS_SUCCESS);
+    t.becomeOwner();
     EXPECT_EQ(t.setPlatformParams(QR_ADMIN, QREWARDS_DEFAULT_CREATE_FEE, 0ULL), QREWARDS_SUCCESS);
-    EXPECT_EQ(t.setQpayhubAddr(QR_ADMIN, QR_HUB), QREWARDS_SUCCESS);
+    // qpayhubAddress is hardcoded to the QPAYHUB contract address id(29,0,0,0).
+    const id hub = id(29, 0, 0, 0);
 
     uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
     t.issueAsset(QR_ALICE, QR_TOKEN, 50000000LL);
     t.registerAsset(QR_ADMIN, pool, QR_TOKEN, QR_ALICE, 1000000ULL, 10000, 0);
 
     long long carolBefore = getBalance(QR_CAROL);
-    long long hubBefore = getBalance(QR_HUB);
+    long long hubBefore = getBalance(hub);
 
     // Deposit 1,352,000 QU: fee 67,600. shareholder leg = 20% = 13,520; perShare = 20;
-    // distributed = 13,520 -> Carol. QPAYHUB leg = 54,080 -> QR_HUB.
+    // distributed = 13,520 -> Carol. QPAYHUB leg = 54,080 -> id(29,0,0,0).
     t.depositQU(QR_FUND, pool, 1352000ULL);
     EXPECT_EQ(t.getState()->pendingDivFeeQUOf(), 67600u);
     t.endEpoch();
     EXPECT_EQ(t.getState()->pendingDivFeeQUOf(), 0u);
     EXPECT_EQ(getBalance(QR_CAROL) - carolBefore, 13520LL);
-    EXPECT_EQ(getBalance(QR_HUB) - hubBefore, 54080LL);
+    EXPECT_EQ(getBalance(hub) - hubBefore, 54080LL);
 }
 
 // Token dividend fee: 20% -> QREWARDS shareholders (paid in the token), 80% -> QPAY wallet.
@@ -650,7 +630,14 @@ TEST(ContractQRewards, StreamedDistributionOneTick)
     EXPECT_EQ(getBalance(QR_ALICE) - a0, 0LL);
     EXPECT_EQ(t.getState()->poolPot(pool, 0), 9500u); // still pending
 
-    // One END_TICK completes the cycle: roll pot->distributable, pay Alice the whole 9500.
+    // Before the ~24h delay elapses, END_TICK starts no cycle.
+    t.endTick();
+    EXPECT_EQ(getBalance(QR_ALICE) - a0, 0LL);
+    EXPECT_EQ(t.getState()->poolPot(pool, 0), 9500u);
+
+    // Advance past the hardcoded delay; one END_TICK (big batch) completes the cycle:
+    // roll pot->distributable, pay Alice the whole 9500.
+    system.tick += QREWARDS_STREAM_DELAY_TICKS;
     t.endTick();
     EXPECT_EQ(getBalance(QR_ALICE) - a0, 9500LL);
     EXPECT_EQ(t.getState()->poolPot(pool, 0), 0u);
@@ -681,6 +668,7 @@ TEST(ContractQRewards, StreamedDistributionAcrossTicks)
     t.depositQU(QR_FUND, pool, 10000ULL); // pot 9500
 
     t.beginEpoch();
+    system.tick += QREWARDS_STREAM_DELAY_TICKS; // past the ~24h delay
     long long a0 = getBalance(QR_ALICE), b0 = getBalance(QR_BOB);
 
     // Drive many ticks; the cycle advances one unit each and finishes within a handful.
