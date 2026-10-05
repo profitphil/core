@@ -213,6 +213,17 @@ protected:
         return 0;
     }
 
+    // One asset's weight contribution: pts * mult * weightBps / BPS^2, computed in 128-bit
+    // and saturated to UINT64_MAX so the multiplication can never overflow 64 bits. (mult
+    // <= 20000 and weightBps <= 1e6, so pts > ~9.2e8 would otherwise wrap uint64.)
+    inline static uint64 weightContribution(uint64 pts, uint64 mult, uint64 weightBps)
+    {
+        uint128 prod = (uint128)pts * (uint128)mult;
+        prod = prod * (uint128)weightBps;
+        uint128 q = div<uint128>(prod, (uint128)(QREWARDS_BPS * QREWARDS_BPS));
+        return (q.high != 0) ? 0xFFFFFFFFFFFFFFFFULL : q.low;
+    }
+
     // Live weight of one user in one pool: sum over the pool's active registered
     // assets of (held/unit) x concentrationMultiplier x weightBps / BPS^2.
     // Excluded (poolId,user) earns 0. Reads holdings straight from the ledger.
@@ -260,8 +271,7 @@ protected:
             locals.pts = div((uint64)locals.held, locals.rule.unit);
             if (locals.pts == 0) continue;
             locals.mult = concentrationMultiplier(locals.pts);
-            locals.add = div(locals.pts * locals.mult * (uint64)locals.rule.weightBps,
-                             QREWARDS_BPS * QREWARDS_BPS);
+            locals.add = weightContribution(locals.pts, locals.mult, (uint64)locals.rule.weightBps);
             output.weight += locals.add;
         }
     }
@@ -416,8 +426,7 @@ protected:
                         if (locals.pts > 0)
                         {
                             locals.mult = concentrationMultiplier(locals.pts);
-                            locals.add = div(locals.pts * locals.mult * (uint64)locals.rule.weightBps,
-                                             QREWARDS_BPS * QREWARDS_BPS);
+                            locals.add = weightContribution(locals.pts, locals.mult, (uint64)locals.rule.weightBps);
                             if (locals.add > 0)
                             {
                                 locals.existing = 0;
@@ -1298,8 +1307,15 @@ public:
 
     INITIALIZE()
     {
-        state.mut().platformOwner = NULL_ID;
-        state.mut().qpayhubAddress = NULL_ID;
+        // Platform owner is HARDCODED (not a first-caller bootstrap) so nobody can claim the
+        // role at deploy time and redirect fees. REPLACE the placeholder below with the real
+        // owner identity before deployment.
+        // TODO(owner): set to the real 60-char owner identity via ID(...).
+        state.mut().platformOwner = ID(_Q, _P, _A, _Y, _N, _O, _W, _S, _W, _Z, _M, _G, _H, _F, _E, _A, _E, _V, _J, _X, _G, _Z, _A, _V, _S, _H, _A, _B, _A, _Z, _D, _D, _B, _D, _I, _H, _T, _E, _B, _O, _P, _C, _O, _G, _H, _R, _G, _B, _C, _Y, _C, _U, _Z, _O, _H, _C);
+        // QPAYHUB contract address = id(29, 0, 0, 0) (receives the 15% create/operating-fee
+        // share and the 80% QU dividend-fee leg; its POST_INCOMING_TRANSFER auto-credits plain
+        // QU to its feePool). QPAYHUB is CONTRACT_INDEX 29 on the live chain.
+        state.mut().qpayhubAddress = id(29, 0, 0, 0);
         // QPAY token dividends wallet (receives the 80% QPAY share of the 5% TOKEN dividend fee).
         state.mut().qpayTokenDividendsAddress = ID(_Q, _P, _A, _Y, _N, _O, _W, _S, _W, _Z, _M, _G, _H, _F, _E, _A, _E, _V, _J, _X, _G, _Z, _A, _V, _S, _H, _A, _B, _A, _Z, _D, _D, _B, _D, _I, _H, _T, _E, _B, _O, _P, _C, _O, _G, _H, _R, _G, _B, _C, _Y, _C, _U, _Z, _O, _H, _C);
         state.mut().createPoolFee = QREWARDS_DEFAULT_CREATE_FEE;

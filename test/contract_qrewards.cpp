@@ -323,6 +323,22 @@ TEST(ContractQRewards, CreatePoolAndWeight)
     EXPECT_EQ(t.previewWeight(pool, QR_BOB), 0u);
 }
 
+// Regression: the weight multiply must not overflow uint64. With unit=1, weight=100x and a
+// 2e9 holding, pts*mult*weightBps = 2e9 * 20000 * 1e6 = 4e19 > 2^64 would wrap in 64-bit math;
+// the 128-bit path yields the correct 4e11.
+TEST(ContractQRewards, WeightNoOverflow)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_ALICE, 5000000000ULL);
+
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+    t.issueAsset(QR_ALICE, QR_TOKEN, 2000000000LL); // 2e9 shares
+    EXPECT_EQ(t.registerAsset(QR_ADMIN, pool, QR_TOKEN, QR_ALICE, 1ULL, 1000000u, 0), QREWARDS_SUCCESS);
+    // pts = 2e9 -> x2.0 multiplier -> 2e9 * 20000 * 1e6 / 1e8 = 400,000,000,000.
+    EXPECT_EQ(t.previewWeight(pool, QR_ALICE), 400000000000ULL);
+}
+
 TEST(ContractQRewards, QuDividendDistributedAtEpoch)
 {
     ContractTestingQRewards t;
