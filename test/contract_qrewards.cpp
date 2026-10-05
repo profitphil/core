@@ -112,7 +112,7 @@ public:
             input.specs.set(i, s);
         }
         QREWARDS::registerAssets_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 11, input, output, caller, 0);
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 10, input, output, caller, 0);
         return output.added;
     }
 
@@ -120,7 +120,7 @@ public:
     {
         QREWARDS::addDividendCurrency_input input{ poolId, assetName, issuer };
         QREWARDS::addDividendCurrency_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 12, input, output, caller, 0);
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 11, input, output, caller, 0);
         return output.returnCode;
     }
 
@@ -159,7 +159,7 @@ public:
     {
         QREWARDS::setFundingRoute_input input{ poolId, clear };
         QREWARDS::setFundingRoute_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 13, input, output, caller, 0);
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 12, input, output, caller, 0);
         return output.returnCode;
     }
 
@@ -167,7 +167,7 @@ public:
     {
         QREWARDS::setExcludedAddress_input input{ poolId, address, excluded };
         QREWARDS::setExcludedAddress_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 14, input, output, caller, 0);
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 13, input, output, caller, 0);
         return output.returnCode;
     }
 
@@ -190,7 +190,7 @@ public:
     {
         QREWARDS::setDistributionMode_input input{ mode };
         QREWARDS::setDistributionMode_output output;
-        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 15, input, output, caller, 0);
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 14, input, output, caller, 0);
         return output.returnCode;
     }
 

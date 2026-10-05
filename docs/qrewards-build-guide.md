@@ -193,16 +193,18 @@ The per-share flooring in the token shareholder leg means it only pays out once 
 
 **Procedures** (index): `createPool(1)` · `registerAsset(2)` · `updateAsset(3)` · `updateWeight(4)`
 · `setPoolAdmin(5)` · `depositDividend(6)` · `depositOperating(7)` · `setPlatformParams(8)` (owner)
-· `setPlatformOwner(9)` (owner, key rotation) · `TransferShareManagementRights(10)`
-· `registerAssets(11)` (batch, ≤16) · `addDividendCurrency(12)` · `setFundingRoute(13)`
-· `setExcludedAddress(14)` (pool admin) · `setDistributionMode(15)` (owner).
+· `TransferShareManagementRights(9)` · `registerAssets(10)` (batch, ≤16) · `addDividendCurrency(11)`
+· `setFundingRoute(12)` · `setExcludedAddress(13)` (pool admin) · `setDistributionMode(14)` (owner).
 
-**Hardcoded in `INITIALIZE` (no setters):** `platformOwner` (set to the real owner identity — not a
-NULL first-caller bootstrap), `qpayhubAddress = id(29,0,0,0)`, and `qpayTokenDividendsAddress` (the
-QRaffle charity wallet). The streamed delay (~24h) and batch size are fixed constants. The **only**
-owner-only functions are `setPlatformParams` (fees), `setDistributionMode` (END_EPOCH ⇄ streamed
-switch), and `setPlatformOwner` (key rotation) — the fee-destination and stream-pacing setters were
-removed so those values can never be repointed after deployment.
+**Hardcoded in `INITIALIZE` (no setters):** `platformOwner` (the QPay wallet — not a NULL
+first-caller bootstrap, and with **no transfer function**, so it is fixed for the life of the
+deployment), `qpayhubAddress = id(29,0,0,0)`, and `qpayTokenDividendsAddress` (the QRaffle charity
+wallet). The streamed delay (~24h) and batch size are fixed constants. The **only** owner-only
+functions are `setPlatformParams` (fees) and `setDistributionMode` (END_EPOCH ⇄ streamed switch);
+the fee-destination, stream-pacing, and ownership-transfer setters were all removed, so none of
+those values can be repointed after deployment. A compromised owner key can at most change fee
+levels or the distribution mode — it cannot redirect funds or seize the role; rotating the owner
+requires a redeploy.
 
 **Functions** (index): `getPool(1)` (admin, label, operatingBalance, `lastTotalWeight`, counts,
 active/paused, and per-currency `assetName`/`pot`/`lifetime`) · `getPoolAsset(2)` ·

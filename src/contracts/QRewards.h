@@ -994,19 +994,10 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // Fee destinations (qpayhubAddress, qpayTokenDividendsAddress) are hardcoded in INITIALIZE
-    // and intentionally have no setters, so they can never be repointed after deployment.
-
-    struct setPlatformOwner_input { id newOwner; };
-    struct setPlatformOwner_output { sint32 returnCode; };
-    PUBLIC_PROCEDURE(setPlatformOwner)
-    {
-        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-        if (state.get().platformOwner != NULL_ID && qpi.invocator() != state.get().platformOwner)
-        { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
-        state.mut().platformOwner = input.newOwner;
-        output.returnCode = QREWARDS_SUCCESS;
-    }
+    // The platform owner (and the fee destinations) are hardcoded in INITIALIZE with no setters,
+    // so they can never be repointed or transferred after deployment. A compromised owner key
+    // therefore cannot hand the role to anyone or redirect fees; rotating the owner requires a
+    // code change + redeploy, which is deliberate.
 
     // Register (or clear) a funding route: a plain QU transfer from the caller is
     // auto-credited to poolId's QU currency via POST_INCOMING_TRANSFER. Lets even
@@ -1264,13 +1255,12 @@ public:
         REGISTER_USER_PROCEDURE(depositDividend, 6);
         REGISTER_USER_PROCEDURE(depositOperating, 7);
         REGISTER_USER_PROCEDURE(setPlatformParams, 8);
-        REGISTER_USER_PROCEDURE(setPlatformOwner, 9);
-        REGISTER_USER_PROCEDURE(TransferShareManagementRights, 10);
-        REGISTER_USER_PROCEDURE(registerAssets, 11);
-        REGISTER_USER_PROCEDURE(addDividendCurrency, 12);
-        REGISTER_USER_PROCEDURE(setFundingRoute, 13);
-        REGISTER_USER_PROCEDURE(setExcludedAddress, 14);
-        REGISTER_USER_PROCEDURE(setDistributionMode, 15);
+        REGISTER_USER_PROCEDURE(TransferShareManagementRights, 9);
+        REGISTER_USER_PROCEDURE(registerAssets, 10);
+        REGISTER_USER_PROCEDURE(addDividendCurrency, 11);
+        REGISTER_USER_PROCEDURE(setFundingRoute, 12);
+        REGISTER_USER_PROCEDURE(setExcludedAddress, 13);
+        REGISTER_USER_PROCEDURE(setDistributionMode, 14);
     }
 
     INITIALIZE()
@@ -1278,7 +1268,8 @@ public:
         // Platform owner is HARDCODED (not a first-caller bootstrap) so nobody can claim the role
         // at deploy time and redirect fees. Owner = the QPay wallet
         // (QPAYNOWSWZMGHFEAEVJXGZAVSHABAZDDBDIHTEBOPCOGHRGBCYCUZOHCVLXG). It can call only
-        // setPlatformParams (fees), setDistributionMode (END_EPOCH<->streamed), setPlatformOwner.
+        // setPlatformParams (fees) and setDistributionMode (END_EPOCH<->streamed). There is no
+        // ownership-transfer function: the owner is fixed for the life of the deployment.
         state.mut().platformOwner = ID(_Q, _P, _A, _Y, _N, _O, _W, _S, _W, _Z, _M, _G, _H, _F, _E, _A, _E, _V, _J, _X, _G, _Z, _A, _V, _S, _H, _A, _B, _A, _Z, _D, _D, _B, _D, _I, _H, _T, _E, _B, _O, _P, _C, _O, _G, _H, _R, _G, _B, _C, _Y, _C, _U, _Z, _O, _H, _C);
         // QPAYHUB contract address = id(29, 0, 0, 0) (receives the 15% create/operating-fee
         // share and the 80% QU dividend-fee leg; its POST_INCOMING_TRANSFER auto-credits plain
