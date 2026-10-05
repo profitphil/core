@@ -1275,10 +1275,10 @@ public:
 
     INITIALIZE()
     {
-        // Platform owner is HARDCODED (not a first-caller bootstrap) so nobody can claim the
-        // role at deploy time and redirect fees. REPLACE the placeholder below with the real
-        // owner identity before deployment.
-        // TODO(owner): set to the real 60-char owner identity via ID(...).
+        // Platform owner is HARDCODED (not a first-caller bootstrap) so nobody can claim the role
+        // at deploy time and redirect fees. Owner = the QPay wallet
+        // (QPAYNOWSWZMGHFEAEVJXGZAVSHABAZDDBDIHTEBOPCOGHRGBCYCUZOHCVLXG). It can call only
+        // setPlatformParams (fees), setDistributionMode (END_EPOCH<->streamed), setPlatformOwner.
         state.mut().platformOwner = ID(_Q, _P, _A, _Y, _N, _O, _W, _S, _W, _Z, _M, _G, _H, _F, _E, _A, _E, _V, _J, _X, _G, _Z, _A, _V, _S, _H, _A, _B, _A, _Z, _D, _D, _B, _D, _I, _H, _T, _E, _B, _O, _P, _C, _O, _G, _H, _R, _G, _B, _C, _Y, _C, _U, _Z, _O, _H, _C);
         // QPAYHUB contract address = id(29, 0, 0, 0) (receives the 15% create/operating-fee
         // share and the 80% QU dividend-fee leg; its POST_INCOMING_TRANSFER auto-credits plain
