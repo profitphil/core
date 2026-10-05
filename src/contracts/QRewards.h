@@ -46,6 +46,8 @@ constexpr uint64 QREWARDS_SNAPSHOT_CAP         = 16384;      // 2^14: max unique
 constexpr uint64 QREWARDS_REGISTRY_SIZE        = (uint64)QREWARDS_MAX_POOLS * QREWARDS_MAX_ASSETS_PER_POOL;
 constexpr uint64 QREWARDS_BPS                  = 10000;
 constexpr uint32 QREWARDS_MAX_WEIGHT_BPS       = 1000000;        // cap weight at 100x
+constexpr uint64 QREWARDS_MAX_LIST_WEIGHT      = 1000000000000ULL; // 1e12: per-recipient list weight cap
+                                                                   // (keeps pot*weight well within uint128; ample for any pro-rata scheme)
 constexpr uint64 QREWARDS_DEFAULT_CREATE_FEE   = 5000000ULL;     // 5M QU to create a pool; protocol-owner tunable
 constexpr uint64 QREWARDS_DEFAULT_OPERATING_FEE = 100000ULL;     // 100k QU/epoch per pool; protocol-owner tunable
 constexpr uint64 QREWARDS_FEE_SHAREHOLDER_PCT  = 70;             // create/operating fee split: 70% QREWARDS shareholders
@@ -552,13 +554,17 @@ protected:
         for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
         {
             locals.cur = locals.meta.currencies.get(locals.k);
-            if (locals.cur.pot == 0) continue;
+            // Fold in any `distributable` too: it is normally 0 in END_EPOCH mode, but if the owner
+            // switched streamed -> END_EPOCH mid-cycle, a pool may have amounts already rolled from
+            // pot into distributable; draining both here prevents those funds from being stranded.
+            if (locals.cur.pot == 0 && locals.cur.distributable == 0) continue;
             // Checks-effects-interactions: freeze the amount and persist pot = 0 BEFORE paying, so
             // the stored state never shows funds that are mid-transfer. Payouts are computed from the
             // frozen amount; the undistributed remainder (rounding dust + any failed sends) is
             // returned to the pot after the loop. (Mirrors the streamed engine's roll-then-pay.)
-            locals.frozen = locals.cur.pot;
+            locals.frozen = locals.cur.pot + locals.cur.distributable;
             locals.cur.pot = 0;
+            locals.cur.distributable = 0;
             locals.meta.currencies.set(locals.k, locals.cur);
             state.mut().poolMeta.set(input.poolId, locals.meta);
 
@@ -976,6 +982,9 @@ public:
         {
             locals.w = input.wallets.get(locals.i);
             locals.wt = input.weights.get(locals.i);
+            // Clamp the weight: relative values only need to be modest, and this keeps the
+            // pot * weight product (computed in uint128 at distribution) far from overflow.
+            if (locals.wt > QREWARDS_MAX_LIST_WEIGHT) locals.wt = QREWARDS_MAX_LIST_WEIGHT;
             setMemory(locals.proto, 0);
             locals.proto.poolId = input.poolId;
             locals.proto.wallet = locals.w;
