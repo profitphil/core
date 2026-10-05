@@ -132,9 +132,11 @@ For the whole contract, once per epoch:
    - **Pass 1** — walk each active registered asset's possessors (`AssetPossessionIterator`),
      read live `numberOfPossessedShares`, skip `SELF` and excluded addresses, add the per-asset
      weight into the `snapshot` map and into `totalWeight`.
-   - **Pass 2** — for each currency with `pot > 0`, iterate the snapshot and pay each holder
-     `pot × weight / totalWeight` (128-bit multiply to avoid overflow); carry the undistributed
-     remainder in `pot`. `lastTotalWeight` is recorded for front ends.
+   - **Pass 2** — for each currency with `pot > 0`, **freeze** the amount and persist `pot = 0`
+     *before* paying (checks-effects-interactions: stored state never shows funds that are
+     mid-transfer), then iterate the snapshot and pay each holder `frozen × weight / totalWeight`
+     (128-bit multiply to avoid overflow); the undistributed remainder (rounding dust + any failed
+     sends) is returned to `pot` after the loop. `lastTotalWeight` is recorded for front ends.
    - If `totalWeight == 0` (no eligible holders) the pots carry to a future epoch.
 
 This all-at-once path (`distributionMode == QREWARDS_DIST_END_EPOCH`, the default) is simplest and

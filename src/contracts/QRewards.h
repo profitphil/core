@@ -527,6 +527,7 @@ protected:
         uint64 weight;
         uint64 payout;
         uint64 distributed;
+        uint64 frozen;
         uint128 prod;
         uint128 pay128;
     };
@@ -552,6 +553,15 @@ protected:
         {
             locals.cur = locals.meta.currencies.get(locals.k);
             if (locals.cur.pot == 0) continue;
+            // Checks-effects-interactions: freeze the amount and persist pot = 0 BEFORE paying, so
+            // the stored state never shows funds that are mid-transfer. Payouts are computed from the
+            // frozen amount; the undistributed remainder (rounding dust + any failed sends) is
+            // returned to the pot after the loop. (Mirrors the streamed engine's roll-then-pay.)
+            locals.frozen = locals.cur.pot;
+            locals.cur.pot = 0;
+            locals.meta.currencies.set(locals.k, locals.cur);
+            state.mut().poolMeta.set(input.poolId, locals.meta);
+
             locals.distributed = 0;
             for (locals.idx = state.get().snapshot.nextElementIndex(NULL_INDEX);
                  locals.idx != NULL_INDEX;
@@ -560,9 +570,9 @@ protected:
                 locals.holder = state.get().snapshot.key(locals.idx);
                 locals.weight = state.get().snapshot.value(locals.idx);
                 if (locals.weight == 0) continue;
-                locals.prod = (uint128)locals.cur.pot * (uint128)locals.weight;
+                locals.prod = (uint128)locals.frozen * (uint128)locals.weight;
                 locals.pay128 = div<uint128>(locals.prod, locals.totalWeight);
-                locals.payout = locals.pay128.low; // <= pot, fits uint64
+                locals.payout = locals.pay128.low; // <= frozen, fits uint64
                 if (locals.payout == 0) continue;
                 if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
                 {
@@ -576,8 +586,9 @@ protected:
                         locals.distributed += locals.payout;
                 }
             }
-            locals.cur.pot -= locals.distributed; // carry rounding dust to next epoch
+            locals.cur.pot = locals.frozen - locals.distributed; // carry rounding dust / failed sends
             locals.meta.currencies.set(locals.k, locals.cur);
+            state.mut().poolMeta.set(input.poolId, locals.meta);
         }
         state.mut().poolMeta.set(input.poolId, locals.meta);
     }
