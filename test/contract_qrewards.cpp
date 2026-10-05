@@ -33,8 +33,11 @@ public:
     uint8 poolPaused(uint64 p) const { return poolMeta.get(p).paused; }
     uint64 poolLastTotalWeight(uint64 p) const { return poolMeta.get(p).lastTotalWeight; }
     uint64 poolPot(uint64 p, uint32 k) const { return poolMeta.get(p).currencies.get(k).pot; }
+    uint64 poolDistributable(uint64 p, uint32 k) const { return poolMeta.get(p).currencies.get(k).distributable; }
     uint64 pendingDivFeeQUOf() const { return pendingDivFeeQU; }
     id qpayTokenAddrOf() const { return qpayTokenDividendsAddress; }
+    uint8 distributionModeOf() const { return distributionMode; }
+    uint8 cycleActiveOf() const { return cycleActive; }
 };
 
 class ContractTestingQRewards : public ContractTesting
@@ -188,6 +191,41 @@ public:
     void endEpoch()
     {
         callSystemProcedure(QREWARDS_CONTRACT_INDEX, END_EPOCH);
+    }
+
+    void beginEpoch()
+    {
+        callSystemProcedure(QREWARDS_CONTRACT_INDEX, BEGIN_EPOCH);
+    }
+
+    void endTick()
+    {
+        callSystemProcedure(QREWARDS_CONTRACT_INDEX, END_TICK);
+    }
+
+    sint32 setDistributionMode(const id& caller, uint8 mode)
+    {
+        QREWARDS::setDistributionMode_input input{ mode };
+        QREWARDS::setDistributionMode_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 17, input, output, caller, 0);
+        return output.returnCode;
+    }
+
+    sint32 setStreamParams(const id& caller, uint32 delayTicks, uint32 batchSize)
+    {
+        QREWARDS::setStreamParams_input input{ delayTicks, batchSize };
+        QREWARDS::setStreamParams_output output;
+        invokeUserProcedure(QREWARDS_CONTRACT_INDEX, 18, input, output, caller, 0);
+        return output.returnCode;
+    }
+
+    // Enable streamed mode with no start delay and a given batch size (owner = QR_ADMIN).
+    void enableStreamed(uint32 batchSize)
+    {
+        EXPECT_EQ(setPlatformOwner(QR_ADMIN, QR_ADMIN), QREWARDS_SUCCESS);
+        EXPECT_EQ(setPlatformParams(QR_ADMIN, QREWARDS_DEFAULT_CREATE_FEE, 0ULL), QREWARDS_SUCCESS); // no operating fee
+        EXPECT_EQ(setDistributionMode(QR_ADMIN, QREWARDS_DIST_STREAMED), QREWARDS_SUCCESS);
+        EXPECT_EQ(setStreamParams(QR_ADMIN, 0u, batchSize), QREWARDS_SUCCESS);
     }
 
     // Simulate a plain (standard) QU transfer landing on the contract address, which the
@@ -569,4 +607,72 @@ TEST(ContractQRewards, FundingRouteCreditsPot)
     // An unrouted sender is ignored (no pot change).
     t.simulateIncomingTransfer(QR_ALICE, 5000LL);
     EXPECT_EQ(t.getState()->poolPot(pool, 0), 19000u);
+}
+
+// Streamed mode: END_EPOCH does NOT distribute; END_TICK pays out across the epoch.
+// With a large batch the whole cycle finishes in one END_TICK.
+TEST(ContractQRewards, StreamedDistributionOneTick)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_ALICE, 5000000000ULL);
+    increaseEnergy(QR_FUND, 5000000000ULL);
+
+    t.enableStreamed(100000u); // streamed, no delay, big batch
+    EXPECT_EQ(t.getState()->distributionModeOf(), QREWARDS_DIST_STREAMED);
+
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+    t.issueAsset(QR_ALICE, QR_TOKEN, 50000000LL);
+    t.registerAsset(QR_ADMIN, pool, QR_TOKEN, QR_ALICE, 1000000ULL, 10000, 0); // Alice weight 75
+    t.depositQU(QR_FUND, pool, 10000ULL); // pot 9500 (fee 500)
+
+    t.beginEpoch();
+    long long a0 = getBalance(QR_ALICE);
+
+    // END_EPOCH in streamed mode must NOT pay (distribution is END_TICK's job).
+    t.endEpoch();
+    EXPECT_EQ(getBalance(QR_ALICE) - a0, 0LL);
+    EXPECT_EQ(t.getState()->poolPot(pool, 0), 9500u); // still pending
+
+    // One END_TICK completes the cycle: roll pot->distributable, pay Alice the whole 9500.
+    t.endTick();
+    EXPECT_EQ(getBalance(QR_ALICE) - a0, 9500LL);
+    EXPECT_EQ(t.getState()->poolPot(pool, 0), 0u);
+    EXPECT_EQ(t.getState()->poolDistributable(pool, 0), 0u);
+    EXPECT_EQ(t.getState()->cycleActiveOf(), 0);
+
+    // Further END_TICKs in the same epoch are no-ops (one cycle per epoch).
+    t.endTick();
+    EXPECT_EQ(getBalance(QR_ALICE) - a0, 9500LL);
+}
+
+// Streamed mode with batchSize = 1: the cycle spans many END_TICKs but still pays everyone
+// exactly once (resumable cursor, no double-pay).
+TEST(ContractQRewards, StreamedDistributionAcrossTicks)
+{
+    ContractTestingQRewards t;
+    increaseEnergy(QR_ADMIN, 10000000000ULL);
+    increaseEnergy(QR_ALICE, 5000000000ULL);
+    increaseEnergy(QR_BOB, 5000000000ULL);
+    increaseEnergy(QR_FUND, 5000000000ULL);
+
+    t.enableStreamed(1u); // one work unit per tick
+
+    uint64 pool = t.createPool(QR_ADMIN, 0, QREWARDS_DEFAULT_CREATE_FEE);
+    t.issueAsset(QR_ALICE, QR_TOKEN, 50000000LL);
+    t.registerAsset(QR_ADMIN, pool, QR_TOKEN, QR_ALICE, 1000000ULL, 10000, 0);
+    t.transferAsset(QR_ALICE, QR_TOKEN, QR_ALICE, 25000000LL, QR_BOB); // Alice 25M, Bob 25M -> weight 31 each
+    t.depositQU(QR_FUND, pool, 10000ULL); // pot 9500
+
+    t.beginEpoch();
+    long long a0 = getBalance(QR_ALICE), b0 = getBalance(QR_BOB);
+
+    // Drive many ticks; the cycle advances one unit each and finishes within a handful.
+    for (int i = 0; i < 12; i++) t.endTick();
+
+    EXPECT_EQ(t.getState()->cycleActiveOf(), 0);
+    EXPECT_EQ(getBalance(QR_ALICE) - a0, 4750LL); // floor(9500 * 31 / 62)
+    EXPECT_EQ(getBalance(QR_BOB) - b0, 4750LL);
+    EXPECT_EQ(t.getState()->poolPot(pool, 0), 0u);
+    EXPECT_EQ(t.getState()->poolDistributable(pool, 0), 0u);
 }

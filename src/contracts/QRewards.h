@@ -55,6 +55,16 @@ constexpr uint64 QREWARDS_DIVFEE_SHAREHOLDER_PCT = 20;          // of the 5% fee
 constexpr uint64 QREWARDS_MAX_EXCLUSIONS       = 65536;         // (poolId,address) exclusions, shared
 constexpr uint64 QREWARDS_CONTRACT_ASSET_NAME  = 19230739006837329ULL; // packed "QREWARD" (contract shares, issuer NULL_ID)
 
+// Distribution modes (state.distributionMode):
+constexpr uint8  QREWARDS_DIST_END_EPOCH       = 0; // (default) distribute every pool in one END_EPOCH tick
+constexpr uint8  QREWARDS_DIST_STREAMED        = 1; // stream one pool at a time across END_TICKs over the epoch
+// Streamed-mode defaults (protocol-owner tunable via setStreamParams):
+constexpr uint32 QREWARDS_STREAM_DELAY_TICKS   = 86400;  // ~24h at ~1 tick/s: wait this many ticks into the epoch before a cycle
+constexpr uint32 QREWARDS_STREAM_BATCH         = 256;    // work units (freezes/payouts) per END_TICK
+constexpr uint16 QREWARDS_NO_CYCLE_EPOCH       = 0xFFFF; // sentinel: no cycle has run yet
+constexpr uint8  QREWARDS_STREAM_IDLE          = 0;      // streaming sub-state: need to freeze the next pool
+constexpr uint8  QREWARDS_STREAM_PAYING        = 1;      // streaming sub-state: paying out the frozen pool
+
 // return codes
 constexpr sint32 QREWARDS_SUCCESS            = 0;
 constexpr sint32 QREWARDS_NOT_ADMIN          = 1;
@@ -120,8 +130,9 @@ public:
     {
         uint64 assetName;
         id     issuer;
-        uint64 pot;       // undistributed revenue, paid out at END_EPOCH
-        uint64 lifetime;  // cumulative revenue ever deposited (stat)
+        uint64 pot;           // revenue accumulating this cycle
+        uint64 distributable; // revenue rolled over from pot and currently being paid out (streamed mode)
+        uint64 lifetime;      // cumulative revenue ever deposited (stat)
         uint8  active;
     };
 
@@ -171,6 +182,22 @@ public:
         id qpayTokenDividendsAddress;
         uint64 createPoolFee;
         uint64 operatingFee;   // per-pool per-epoch
+
+        // --- Streamed distribution (dormant unless distributionMode == QREWARDS_DIST_STREAMED) ---
+        uint8  distributionMode;     // 0 = END_EPOCH (default), 1 = streamed across END_TICKs
+        uint32 streamDelayTicks;     // ticks into the epoch before a cycle may start
+        uint32 streamBatchSize;      // work units per END_TICK
+        uint32 epochStartTick;       // qpi.tick() captured at BEGIN_EPOCH
+        uint16 lastCycleEpoch;       // epoch in which the last cycle was started (NO_CYCLE_EPOCH = none)
+        uint8  cycleActive;          // 1 = a distribution cycle is in progress
+        uint8  streamState;          // IDLE (freeze next pool) / PAYING (pay current pool)
+        uint8  streamCurrencyStarted;// 1 = streamFrozenAmt captured for the current currency
+        uint32 streamPoolCursor;     // pool being processed this cycle
+        uint8  streamCurrencyCursor; // currency index within the current pool
+        sint64 streamPayCursor;      // snapshot element index last paid (resume via nextElementIndex)
+        uint64 streamTotalWeight;    // frozen total weight of the current pool
+        uint64 streamFrozenAmt;      // frozen distributable amount of the current currency
+        uint64 streamPaidSum;        // amount paid so far for the current currency
     };
 
 protected:
@@ -335,12 +362,13 @@ protected:
         }
     }
 
-    // Distribute one pool's currency pots to its holders by live weighted holdings.
-    // Pass 1 builds the holder->weight snapshot from the live asset ledger; pass 2
-    // pays each holder (pot * weight / totalWeight), carrying rounding dust in `pot`.
-    struct DistributePool_input { uint64 poolId; };
-    struct DistributePool_output { };
-    struct DistributePool_locals
+    // Build the live holder -> weight snapshot for a pool into state.snapshot, and return
+    // the total weight. Reads holdings straight from the asset ledger; must run within one
+    // tick (the ledger iterator cannot be resumed across ticks). Excluded addresses and SELF
+    // are skipped. Shared by END_EPOCH distribution and the streamed engine's freeze step.
+    struct SnapshotPool_input { uint64 poolId; };
+    struct SnapshotPool_output { uint64 totalWeight; };
+    struct SnapshotPool_locals
     {
         PoolMeta meta;
         uint64 base;
@@ -357,24 +385,12 @@ protected:
         uint64 mult;
         uint64 add;
         uint64 existing;
-        uint64 totalWeight;
-        uint32 k;
-        DivCurrency cur;
-        sint64 idx;
-        uint64 weight;
-        uint64 payout;
-        uint64 distributed;
-        uint128 prod;
-        uint128 pay128;
     };
-    PRIVATE_PROCEDURE_WITH_LOCALS(DistributePool)
+    PRIVATE_PROCEDURE_WITH_LOCALS(SnapshotPool)
     {
-        locals.meta = state.get().poolMeta.get(input.poolId);
-        if (!locals.meta.active || locals.meta.paused || locals.meta.numAssets == 0) return;
-
-        // Pass 1: build live holder -> weight snapshot.
+        output.totalWeight = 0;
         state.mut().snapshot.reset();
-        locals.totalWeight = 0;
+        locals.meta = state.get().poolMeta.get(input.poolId);
         locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
         for (locals.i = 0; locals.i < locals.meta.numAssets; locals.i++)
         {
@@ -410,7 +426,7 @@ protected:
                                 // updates in place; a new key is dropped iff the map is full).
                                 if (state.mut().snapshot.set(locals.holder, locals.existing + locals.add) != NULL_INDEX)
                                 {
-                                    locals.totalWeight += locals.add;
+                                    output.totalWeight += locals.add;
                                 }
                             }
                         }
@@ -419,16 +435,45 @@ protected:
                 locals.iter.next();
             }
         }
+    }
+
+    // END_EPOCH distribution (distributionMode == QREWARDS_DIST_END_EPOCH): snapshot the pool
+    // and pay every currency's pot pro-rata by weight, all in this tick. Rounding dust stays
+    // in pot and carries. Fine for a handful of pools; use streamed mode to scale out.
+    struct DistributePool_input { uint64 poolId; };
+    struct DistributePool_output { };
+    struct DistributePool_locals
+    {
+        PoolMeta meta;
+        SnapshotPool_input spi;
+        SnapshotPool_output spo;
+        uint64 totalWeight;
+        uint32 k;
+        DivCurrency cur;
+        sint64 idx;
+        id holder;
+        uint64 weight;
+        uint64 payout;
+        uint64 distributed;
+        uint128 prod;
+        uint128 pay128;
+    };
+    PRIVATE_PROCEDURE_WITH_LOCALS(DistributePool)
+    {
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (!locals.meta.active || locals.meta.paused || locals.meta.numAssets == 0) return;
+
+        locals.spi.poolId = input.poolId;
+        CALL(SnapshotPool, locals.spi, locals.spo);
+        locals.totalWeight = locals.spo.totalWeight;
 
         locals.meta.lastTotalWeight = locals.totalWeight;
         if (locals.totalWeight == 0)
         {
-            // No eligible holders: pots carry to a future epoch.
-            state.mut().poolMeta.set(input.poolId, locals.meta);
+            state.mut().poolMeta.set(input.poolId, locals.meta); // no eligible holders: pots carry
             return;
         }
 
-        // Pass 2: pay each currency's pot pro-rata by weight.
         for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
         {
             locals.cur = locals.meta.currencies.get(locals.k);
@@ -461,6 +506,127 @@ protected:
             locals.meta.currencies.set(locals.k, locals.cur);
         }
         state.mut().poolMeta.set(input.poolId, locals.meta);
+    }
+
+    // Streamed distribution (distributionMode == QREWARDS_DIST_STREAMED): advance one
+    // distribution cycle by up to `streamBatchSize` work units, called from END_TICK. A cycle
+    // walks pools in order; for each pool it rolls pot->distributable and freezes the holder
+    // snapshot in one work unit, then pays the frozen amounts out over subsequent work units.
+    // Cursors live in state, so a cycle resumes exactly across ticks and even across epoch
+    // boundaries (it is never reset mid-cycle), which makes it idempotent: no holder is paid
+    // twice and no funds are lost (undistributed amounts stay in pot/distributable and carry).
+    struct StreamDistribute_input { };
+    struct StreamDistribute_output { };
+    struct StreamDistribute_locals
+    {
+        uint32 budget;
+        PoolMeta meta;
+        SnapshotPool_input spi;
+        SnapshotPool_output spo;
+        uint32 k;
+        DivCurrency cur;
+        sint64 idx;
+        id holder;
+        uint64 weight;
+        uint64 payout;
+        uint128 prod;
+        uint128 pay128;
+    };
+    PRIVATE_PROCEDURE_WITH_LOCALS(StreamDistribute)
+    {
+        locals.budget = state.get().streamBatchSize;
+        while (locals.budget > 0)
+        {
+            locals.budget--;
+            if (state.get().streamPoolCursor >= state.get().numPools)
+            {
+                state.mut().cycleActive = 0; // cycle complete
+                return;
+            }
+
+            if (state.get().streamState == QREWARDS_STREAM_IDLE)
+            {
+                // Start a pool: roll pot -> distributable, then freeze its snapshot (one unit).
+                locals.meta = state.get().poolMeta.get(state.get().streamPoolCursor);
+                if (!locals.meta.active || locals.meta.paused || locals.meta.numAssets == 0)
+                {
+                    state.mut().streamPoolCursor = state.get().streamPoolCursor + 1;
+                    continue;
+                }
+                for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+                {
+                    locals.cur = locals.meta.currencies.get(locals.k);
+                    locals.cur.distributable += locals.cur.pot;
+                    locals.cur.pot = 0;
+                    locals.meta.currencies.set(locals.k, locals.cur);
+                }
+                locals.spi.poolId = state.get().streamPoolCursor;
+                CALL(SnapshotPool, locals.spi, locals.spo);
+                locals.meta.lastTotalWeight = locals.spo.totalWeight;
+                state.mut().poolMeta.set(state.get().streamPoolCursor, locals.meta);
+                state.mut().streamTotalWeight = locals.spo.totalWeight;
+                state.mut().streamState = QREWARDS_STREAM_PAYING;
+                state.mut().streamCurrencyCursor = 0;
+                state.mut().streamCurrencyStarted = 0;
+                state.mut().streamPayCursor = NULL_INDEX;
+                continue;
+            }
+
+            // PAYING
+            locals.meta = state.get().poolMeta.get(state.get().streamPoolCursor);
+            if (state.get().streamCurrencyCursor >= locals.meta.numCurrencies
+                || state.get().streamTotalWeight == 0)
+            {
+                state.mut().streamPoolCursor = state.get().streamPoolCursor + 1;
+                state.mut().streamState = QREWARDS_STREAM_IDLE;
+                continue;
+            }
+            locals.cur = locals.meta.currencies.get(state.get().streamCurrencyCursor);
+            if (!state.get().streamCurrencyStarted)
+            {
+                state.mut().streamFrozenAmt = locals.cur.distributable;
+                state.mut().streamPaidSum = 0;
+                state.mut().streamPayCursor = NULL_INDEX;
+                state.mut().streamCurrencyStarted = 1;
+                if (locals.cur.distributable == 0)
+                {
+                    // nothing to pay in this currency; advance
+                    state.mut().streamCurrencyCursor = state.get().streamCurrencyCursor + 1;
+                    state.mut().streamCurrencyStarted = 0;
+                }
+                continue;
+            }
+            locals.idx = state.get().snapshot.nextElementIndex(state.get().streamPayCursor);
+            if (locals.idx == NULL_INDEX)
+            {
+                // currency done: carry the undistributed dust, advance to next currency
+                locals.cur.distributable = state.get().streamFrozenAmt - state.get().streamPaidSum;
+                locals.meta.currencies.set(state.get().streamCurrencyCursor, locals.cur);
+                state.mut().poolMeta.set(state.get().streamPoolCursor, locals.meta);
+                state.mut().streamCurrencyCursor = state.get().streamCurrencyCursor + 1;
+                state.mut().streamCurrencyStarted = 0;
+                continue;
+            }
+            locals.holder = state.get().snapshot.key(locals.idx);
+            locals.weight = state.get().snapshot.value(locals.idx);
+            state.mut().streamPayCursor = locals.idx;
+            if (locals.weight == 0) continue;
+            locals.prod = (uint128)state.get().streamFrozenAmt * (uint128)locals.weight;
+            locals.pay128 = div<uint128>(locals.prod, (uint128)state.get().streamTotalWeight);
+            locals.payout = locals.pay128.low;
+            if (locals.payout == 0) continue;
+            if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
+            {
+                if (qpi.transfer(locals.holder, (sint64)locals.payout) >= 0)
+                    state.mut().streamPaidSum = state.get().streamPaidSum + locals.payout;
+            }
+            else
+            {
+                if (qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
+                        SELF, SELF, (sint64)locals.payout, locals.holder) >= 0)
+                    state.mut().streamPaidSum = state.get().streamPaidSum + locals.payout;
+            }
+        }
     }
 
 public:
@@ -895,6 +1061,31 @@ public:
         }
     }
 
+    // Protocol owner: switch distribution between END_EPOCH (0, default) and streamed (1).
+    // Takes effect from the next cycle; an in-progress streamed cycle finishes first.
+    struct setDistributionMode_input { uint8 mode; };
+    struct setDistributionMode_output { sint32 returnCode; };
+    PUBLIC_PROCEDURE(setDistributionMode)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
+        state.mut().distributionMode = (input.mode == QREWARDS_DIST_STREAMED) ? QREWARDS_DIST_STREAMED : QREWARDS_DIST_END_EPOCH;
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    // Protocol owner: tune streamed-mode pacing. delayTicks = ticks into the epoch before a
+    // cycle starts; batchSize = work units (freezes/payouts) per tick (clamped to >=1).
+    struct setStreamParams_input { uint32 delayTicks; uint32 batchSize; };
+    struct setStreamParams_output { sint32 returnCode; };
+    PUBLIC_PROCEDURE(setStreamParams)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
+        state.mut().streamDelayTicks = input.delayTicks;
+        state.mut().streamBatchSize = (input.batchSize == 0) ? 1 : input.batchSize;
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
     /**************************************/
     /********FUNCTIONS (read-only)*********/
     /**************************************/
@@ -999,7 +1190,7 @@ public:
     }
 
     struct getPlatform_input { };
-    struct getPlatform_output { id platformOwner; id qpayhubAddress; id qpayTokenDividendsAddress; uint64 createPoolFee; uint64 operatingFee; uint32 numPools; };
+    struct getPlatform_output { id platformOwner; id qpayhubAddress; id qpayTokenDividendsAddress; uint64 createPoolFee; uint64 operatingFee; uint32 numPools; uint8 distributionMode; uint32 streamDelayTicks; uint32 streamBatchSize; uint8 cycleActive; };
     PUBLIC_FUNCTION(getPlatform)
     {
         output.platformOwner = state.get().platformOwner;
@@ -1008,6 +1199,10 @@ public:
         output.createPoolFee = state.get().createPoolFee;
         output.operatingFee = state.get().operatingFee;
         output.numPools = state.get().numPools;
+        output.distributionMode = state.get().distributionMode;
+        output.streamDelayTicks = state.get().streamDelayTicks;
+        output.streamBatchSize = state.get().streamBatchSize;
+        output.cycleActive = state.get().cycleActive;
     }
 
     struct isExcluded_input { uint64 poolId; id address; };
@@ -1097,6 +1292,8 @@ public:
         REGISTER_USER_PROCEDURE(setQpayhubAddress, 14);
         REGISTER_USER_PROCEDURE(setExcludedAddress, 15);
         REGISTER_USER_PROCEDURE(setQpayTokenDividendsAddress, 16);
+        REGISTER_USER_PROCEDURE(setDistributionMode, 17);
+        REGISTER_USER_PROCEDURE(setStreamParams, 18);
     }
 
     INITIALIZE()
@@ -1109,6 +1306,28 @@ public:
         state.mut().operatingFee = QREWARDS_DEFAULT_OPERATING_FEE;
         state.mut().pendingDivFeeQU = 0;
         state.mut().numPools = 0;
+
+        // Streamed distribution: dormant by default (END_EPOCH mode). Protocol owner flips it on.
+        state.mut().distributionMode = QREWARDS_DIST_END_EPOCH;
+        state.mut().streamDelayTicks = QREWARDS_STREAM_DELAY_TICKS;
+        state.mut().streamBatchSize = QREWARDS_STREAM_BATCH;
+        state.mut().epochStartTick = 0;
+        state.mut().lastCycleEpoch = QREWARDS_NO_CYCLE_EPOCH;
+        state.mut().cycleActive = 0;
+        state.mut().streamState = QREWARDS_STREAM_IDLE;
+        state.mut().streamCurrencyStarted = 0;
+        state.mut().streamPoolCursor = 0;
+        state.mut().streamCurrencyCursor = 0;
+        state.mut().streamPayCursor = NULL_INDEX;
+        state.mut().streamTotalWeight = 0;
+        state.mut().streamFrozenAmt = 0;
+        state.mut().streamPaidSum = 0;
+    }
+
+    BEGIN_EPOCH()
+    {
+        // Anchor the epoch so streamed mode can wait streamDelayTicks before starting a cycle.
+        state.mut().epochStartTick = qpi.tick();
     }
 
     struct END_EPOCH_locals
@@ -1166,16 +1385,45 @@ public:
             state.mut().pendingDivFeeQU = 0;
         }
 
-        // 3) Distribute each active pool's currency pots to live holders by weight.
-        for (locals.i = 0; locals.i < state.get().numPools; locals.i++)
+        // 3) Distribute pots. In END_EPOCH mode, pay every active pool now (one tick). In
+        //    streamed mode, END_TICK does it across the epoch, so skip here.
+        if (state.get().distributionMode == QREWARDS_DIST_END_EPOCH)
         {
-            locals.dpi.poolId = locals.i;
-            CALL(DistributePool, locals.dpi, locals.dpo);
+            for (locals.i = 0; locals.i < state.get().numPools; locals.i++)
+            {
+                locals.dpi.poolId = locals.i;
+                CALL(DistributePool, locals.dpi, locals.dpo);
+            }
+            state.mut().snapshot.reset();
         }
-        state.mut().snapshot.reset();
 
         state.mut().fundingRoute.cleanupIfNeeded();
         state.mut().excluded.cleanupIfNeeded();
+    }
+
+    // Streamed-mode driver. Once per epoch, after streamDelayTicks have elapsed, start a
+    // distribution cycle; thereafter advance it a batch per tick until every pool is paid.
+    // Dormant (does nothing) in the default END_EPOCH mode.
+    struct END_TICK_locals { StreamDistribute_input sdi; StreamDistribute_output sdo; };
+    END_TICK_WITH_LOCALS()
+    {
+        if (state.get().distributionMode != QREWARDS_DIST_STREAMED) return;
+        if (!state.get().cycleActive)
+        {
+            // Start at most one cycle per epoch, once we're far enough into it.
+            if (state.get().lastCycleEpoch != qpi.epoch()
+                && (qpi.tick() - state.get().epochStartTick) >= state.get().streamDelayTicks)
+            {
+                state.mut().cycleActive = 1;
+                state.mut().streamPoolCursor = 0;
+                state.mut().streamState = QREWARDS_STREAM_IDLE;
+                state.mut().lastCycleEpoch = qpi.epoch();
+            }
+        }
+        if (state.get().cycleActive)
+        {
+            CALL(StreamDistribute, locals.sdi, locals.sdo);
+        }
     }
 
     // Credit plain incoming QU to a routed pool's QU pot (slot 0).

@@ -128,6 +128,37 @@ For the whole contract, once per epoch:
      remainder in `pot`. `lastTotalWeight` is recorded for front ends.
    - If `totalWeight == 0` (no eligible holders) the pots carry to a future epoch.
 
+This all-at-once path (`distributionMode == QREWARDS_DIST_END_EPOCH`, the default) is simplest and
+fine for a handful of pools. For scale, flip to streamed mode (below).
+
+---
+
+## 5b. Optional: streamed distribution (scale mode, dormant by default)
+
+A second engine spreads distribution across the **whole epoch** instead of one tick, so it scales
+to many pools / large holder counts. It is **off by default** (`distributionMode = 0`); both code
+paths ship, and the protocol owner flips it on with one transaction — **no redeploy**:
+
+- `setDistributionMode(1)` → streamed; `setDistributionMode(0)` → back to END_EPOCH.
+- `setStreamParams(delayTicks, batchSize)` → how long to wait into the epoch before a cycle starts
+  (default `QREWARDS_STREAM_DELAY_TICKS ≈ 24h`), and how many work units to do per tick
+  (`QREWARDS_STREAM_BATCH`). `getPlatform` reports mode, params, and whether a cycle is active.
+
+**How it runs** (`END_TICK`, once `delayTicks` into the epoch, once per epoch):
+a cycle walks pools in order via a persisted cursor. For each pool it (1) rolls `pot → distributable`
+and **freezes** the holder snapshot in one tick (`SnapshotPool`), then (2) pays the frozen amounts
+out over as many subsequent ticks as needed (`pot × weight / totalWeight`), carrying dust in
+`distributable`. `END_EPOCH` skips its own distribution loop in this mode.
+
+**Why it's safe/idempotent:** the snapshot is frozen in a single tick (the ledger iterator can't be
+resumed across ticks), but payout streams freely. All cursors live in state, so a cycle resumes
+exactly across ticks — and even across epoch boundaries (it's never reset mid-cycle) — so no holder
+is paid twice and undistributed funds always stay in `pot`/`distributable` and carry.
+
+**Limits:** payout duration and pool count are effectively unbounded; the only ceiling is a *single*
+pool whose holder set is too large to **freeze in one tick** (~100K+, far beyond typical use). A
+giant single pool would need intra-pool freeze pagination — not implemented (cap such a pool instead).
+
 ---
 
 ## 6. Fees
@@ -162,7 +193,8 @@ The per-share flooring in the token shareholder leg means it only pays out once 
 · `setPlatformOwner(9)` (first caller claims it from NULL) · `TransferShareManagementRights(10)`
 · `registerAssets(11)` (batch, ≤16) · `addDividendCurrency(12)` · `setFundingRoute(13)`
 · `setQpayhubAddress(14)` (owner) · `setExcludedAddress(15)` (pool admin) ·
-`setQpayTokenDividendsAddress(16)` (owner).
+`setQpayTokenDividendsAddress(16)` (owner) · `setDistributionMode(17)` (owner) ·
+`setStreamParams(18)` (owner).
 
 **Functions** (index): `getPool(1)` (admin, label, operatingBalance, `lastTotalWeight`, counts,
 active/paused, and per-currency `assetName`/`pot`/`lifetime`) · `getPoolAsset(2)` ·
