@@ -47,6 +47,13 @@ constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool rou
 constexpr uint32 QREWARDS_PAGE                 = 256;        // page size for paginated views
 constexpr uint64 QREWARDS_SNAPSHOT_CAP         = 16384;      // 2^14: max unique holders per pool in one epoch snapshot
 constexpr uint64 QREWARDS_REGISTRY_SIZE        = (uint64)QREWARDS_MAX_POOLS * QREWARDS_MAX_ASSETS_PER_POOL;
+// NFT-backed weight (QBAY): a pool admin curates QBAY NFT ids as an extra weight source in
+// holdings mode. Each epoch the snapshot reads each registered NFT's LIVE QBAY possessor and
+// credits the NFT's flat weightPoints to that wallet (no action needed by the holder, matching
+// the pure-snapshot model). An NFT whose QBAY auction is still open does not count.
+constexpr uint32 QREWARDS_MAX_NFT_PER_POOL     = 128;       // curated QBAY NFT ids per pool
+constexpr uint64 QREWARDS_NFT_REGISTRY_SIZE    = (uint64)QREWARDS_MAX_POOLS * QREWARDS_MAX_NFT_PER_POOL;
+constexpr uint32 QREWARDS_QBAY_MAX_NFT_ID      = 2097152;   // QBAY_MAX_NUMBER_NFT: larger ids alias in QBAY's array
 constexpr uint64 QREWARDS_BPS                  = 10000;
 constexpr uint32 QREWARDS_MAX_WEIGHT_BPS       = 1000000;        // cap weight at 100x
 constexpr uint64 QREWARDS_MAX_LIST_WEIGHT      = 1000000000000ULL; // 1e12: per-recipient list weight cap
@@ -133,6 +140,16 @@ public:
         uint8  kind;
     };
 
+    // One admin-curated QBAY NFT id counted toward a pool's weight in holdings mode. weightPoints
+    // is flat (no concentration tier); rarer ids can simply be registered with more points. The
+    // snapshot reads the NFT's live QBAY possessor each epoch, so no per-NFT cursor state is kept.
+    struct NFTRule
+    {
+        uint32 nftId;         // QBAY global NFT id (< QREWARDS_QBAY_MAX_NFT_ID)
+        uint32 weightPoints;  // flat weight contributed while this id is held
+        uint8  active;        // 1 = counted, 0 = ignored
+    };
+
     // A dividend currency for a pool. assetName==0 && issuer==NULL_ID means QU.
     // `pot` is the accumulated-but-undistributed revenue (carried across epochs
     // if there were no eligible holders, plus per-epoch rounding dust).
@@ -153,6 +170,7 @@ public:
         uint64 operatingBalance;  // QU reserve for the per-epoch operating fee
         uint64 lastTotalWeight;   // total weight at the last distribution (for front ends)
         uint32 numAssets;
+        uint32 numNfts;           // registered QBAY NFT ids (holdings mode)
         uint32 missedEpochs;      // consecutive epochs the operating fee could not be paid
         uint32 listVersion;       // bumped by clearRecipients; only entries of the current version count
         uint32 listCount;         // live recipient-list entries for this pool (enforces QREWARDS_MAX_LIST_PER_POOL)
@@ -194,6 +212,7 @@ public:
         uint64 pendingDivFeeQU; // QU dividend-fee skim, flushed 80/20 at END_EPOCH
         Array<PoolMeta, QREWARDS_MAX_POOLS> poolMeta;
         Array<AssetRule, QREWARDS_REGISTRY_SIZE> registry;           // pool p asset i at p*MAX_ASSETS+i
+        Array<NFTRule, QREWARDS_NFT_REGISTRY_SIZE> nftRegistry;      // pool p NFT i at p*MAX_NFT_PER_POOL+i
         // sourceId -> poolId: a plain QU transfer from sourceId is credited to that pool's QU currency.
         HashMap<id, uint64, QREWARDS_MAX_FUNDERS> fundingRoute;
         uint32 numPools;
@@ -241,6 +260,27 @@ protected:
         if (basePoints >= 10)  return 12500;
         if (basePoints >= 1)   return 10000;
         return 0;
+    }
+
+    // NULL_ID and every contract id -- current or future -- have their upper 192 bits zero. Such
+    // ids are never credited/paid: paying a contract runs its POST_INCOMING_TRANSFER, which can
+    // abort the payer. (An NFT held by a contract simply contributes no weight.)
+    inline static bit isReservedId(id x)
+    {
+        return x.u64._1 == 0 && x.u64._2 == 0 && x.u64._3 == 0;
+    }
+
+    // Order-preserving key of a qpi date (year is 0..99 since 2000), for auction-end comparison.
+    inline static uint64 dateKey(uint64 y, uint64 mo, uint64 d, uint64 h, uint64 mi, uint64 s)
+    {
+        return ((((y * 16 + mo) * 32 + d) * 32 + h) * 64 + mi) * 64 + s;
+    }
+
+    // A QBAY NFT counts only when no auction is running on it: QBAY hands possession to the current
+    // top bidder while an auction is open and judges auctions by their end date, not a reset flag.
+    inline static bit nftSettled(uint8 statusOfAuction, uint64 endKey, uint64 nowKey)
+    {
+        return statusOfAuction == 0 || nowKey > endKey;
     }
 
     // One asset's weight contribution: pts * mult * weightBps / BPS^2, computed in 128-bit
@@ -442,6 +482,13 @@ protected:
         uint64 stored;
         sint64 ridx;
         RecipientEntry rentry;
+        NFTRule nftRule;
+        QBAY::getInfoOfNFTById_input qbayIn;
+        QBAY::getInfoOfNFTById_output qbayOut;
+        uint64 nowKey;
+        uint64 nftBase;
+        uint32 nftI;
+        id possessor;
     };
     PRIVATE_PROCEDURE_WITH_LOCALS(SnapshotPool)
     {
@@ -511,6 +558,42 @@ protected:
                     }
                 }
                 locals.iter.next();
+            }
+        }
+
+        // NFT weight (holdings mode): credit each registered NFT's LIVE QBAY possessor its flat
+        // weightPoints. Read fresh every epoch (no cursor), so an NFT that changed hands is paid
+        // to whoever holds it now; an NFT in a running auction, held by SELF/a contract, or whose
+        // possessor is excluded contributes nothing. Bounded by QREWARDS_MAX_NFT_PER_POOL lookups.
+        if (locals.meta.numNfts > 0)
+        {
+            locals.nowKey = dateKey(qpi.year(), qpi.month(), qpi.day(), qpi.hour(), qpi.minute(), qpi.second());
+            locals.nftBase = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
+            for (locals.nftI = 0; locals.nftI < locals.meta.numNfts; locals.nftI++)
+            {
+                locals.nftRule = state.get().nftRegistry.get(locals.nftBase + locals.nftI);
+                if (!locals.nftRule.active || locals.nftRule.weightPoints == 0) continue;
+                locals.qbayIn.NFTId = locals.nftRule.nftId;
+                CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
+                if (interContractCallError != NoCallError) continue;
+                locals.possessor = locals.qbayOut.possessor;
+                if (locals.possessor == SELF || isReservedId(locals.possessor)) continue;
+                if (!nftSettled(locals.qbayOut.statusOfAuction,
+                        dateKey(locals.qbayOut.yearAuctionEnded, locals.qbayOut.monthAuctionEnded, locals.qbayOut.dayAuctionEnded,
+                                locals.qbayOut.hourAuctionEnded, locals.qbayOut.minuteAuctionEnded, locals.qbayOut.secondAuctionEnded),
+                        locals.nowKey)) continue;
+                setMemory(locals.proto, 0);
+                locals.proto.poolId = input.poolId;
+                locals.proto.wallet = locals.possessor;
+                locals.exKey = qpi.K12(locals.proto);
+                locals.exFlag = 0;
+                if (state.get().excluded.get(locals.exKey, locals.exFlag) && locals.exFlag) continue;
+                locals.add = (uint64)locals.nftRule.weightPoints;
+                locals.existing = 0;
+                state.get().snapshot.get(locals.possessor, locals.existing);
+                locals.stored = satAdd64(locals.existing, locals.add);
+                if (state.mut().snapshot.set(locals.possessor, locals.stored) != NULL_INDEX)
+                    output.totalWeight = output.totalWeight + (uint128)(locals.stored - locals.existing);
             }
         }
     }
@@ -862,6 +945,87 @@ public:
             state.mut().registry.set(input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL + locals.meta.numAssets, locals.rule);
             locals.meta.numAssets++;
             output.added++;
+        }
+        state.mut().poolMeta.set(input.poolId, locals.meta);
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    // Register a QBAY NFT id as a weight source (holdings mode). The id must be below QBAY's NFT
+    // capacity (larger ids alias in QBAY's array), not already registered, and currently minted.
+    struct registerNFT_input { uint64 poolId; uint32 nftId; uint32 weightPoints; };
+    struct registerNFT_output { sint32 returnCode; uint32 index; };
+    struct registerNFT_locals
+    {
+        PoolMeta meta; NFTRule rule; uint64 base; uint32 i;
+        QBAY::getInfoOfNFTById_input qbayIn; QBAY::getInfoOfNFTById_output qbayOut;
+    };
+    PUBLIC_PROCEDURE_WITH_LOCALS(registerNFT)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (!locals.meta.active) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
+        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        if (input.weightPoints == 0 || input.nftId >= QREWARDS_QBAY_MAX_NFT_ID) { output.returnCode = QREWARDS_INVALID_PARAM; return; }
+        if (locals.meta.numNfts >= QREWARDS_MAX_NFT_PER_POOL) { output.returnCode = QREWARDS_REGISTRY_FULL; return; }
+
+        locals.base = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
+        for (locals.i = 0; locals.i < locals.meta.numNfts; locals.i++)
+        {
+            if (state.get().nftRegistry.get(locals.base + locals.i).nftId == input.nftId)
+            { output.returnCode = QREWARDS_INVALID_PARAM; return; } // already registered
+        }
+
+        locals.qbayIn.NFTId = input.nftId;
+        CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
+        if (interContractCallError != NoCallError || locals.qbayOut.possessor == NULL_ID)
+        { output.returnCode = QREWARDS_ASSET_NOT_ISSUED; return; }
+
+        setMemory(locals.rule, 0);
+        locals.rule.nftId = input.nftId;
+        locals.rule.weightPoints = input.weightPoints;
+        locals.rule.active = 1;
+        output.index = locals.meta.numNfts;
+        state.mut().nftRegistry.set(locals.base + output.index, locals.rule);
+        locals.meta.numNfts++;
+        state.mut().poolMeta.set(input.poolId, locals.meta);
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    struct updateNFT_input { uint64 poolId; uint32 index; uint32 weightPoints; uint8 active; };
+    struct updateNFT_output { sint32 returnCode; };
+    struct updateNFT_locals { PoolMeta meta; NFTRule rule; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(updateNFT)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        if (input.index >= locals.meta.numNfts) { output.returnCode = QREWARDS_INVALID_INDEX; return; }
+        if (input.weightPoints == 0) { output.returnCode = QREWARDS_INVALID_PARAM; return; }
+        locals.rule = state.get().nftRegistry.get(input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL + input.index);
+        locals.rule.weightPoints = input.weightPoints;
+        locals.rule.active = (input.active != 0) ? 1 : 0;
+        state.mut().nftRegistry.set(input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL + input.index, locals.rule);
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    // Remove a registered NFT (swap-remove, so registry slots are reused).
+    struct removeNFT_input { uint64 poolId; uint32 index; };
+    struct removeNFT_output { sint32 returnCode; };
+    struct removeNFT_locals { PoolMeta meta; uint64 base; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(removeNFT)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        if (input.index >= locals.meta.numNfts) { output.returnCode = QREWARDS_INVALID_INDEX; return; }
+        locals.base = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
+        locals.meta.numNfts--;
+        if (input.index != locals.meta.numNfts)
+        {
+            state.mut().nftRegistry.set(locals.base + input.index, state.get().nftRegistry.get(locals.base + locals.meta.numNfts));
         }
         state.mut().poolMeta.set(input.poolId, locals.meta);
         output.returnCode = QREWARDS_SUCCESS;
@@ -1296,10 +1460,12 @@ public:
         uint64 operatingBalance;
         uint64 lastTotalWeight;
         uint32 numAssets;
+        uint32 numNfts;
         uint32 missedEpochs;
         uint8 numCurrencies;
         uint8 active;
         uint8 paused;
+        uint8 targetMode;
         Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyAssetName;
         Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyPot;
         Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyLifetime;
@@ -1316,10 +1482,12 @@ public:
         output.operatingBalance = locals.meta.operatingBalance;
         output.lastTotalWeight = locals.meta.lastTotalWeight;
         output.numAssets = locals.meta.numAssets;
+        output.numNfts = locals.meta.numNfts;
         output.missedEpochs = locals.meta.missedEpochs;
         output.numCurrencies = locals.meta.numCurrencies;
         output.active = locals.meta.active;
         output.paused = locals.meta.paused;
+        output.targetMode = locals.meta.targetMode;
         for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
         {
             locals.cur = locals.meta.currencies.get(locals.k);
@@ -1369,6 +1537,44 @@ public:
             output.assets.set(locals.i, locals.rule);
         }
         output.count = locals.meta.numAssets;
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    struct getPoolNFT_input { uint64 poolId; uint32 index; };
+    struct getPoolNFT_output { uint32 nftId; uint32 weightPoints; uint8 active; sint32 returnCode; };
+    struct getPoolNFT_locals { PoolMeta meta; NFTRule rule; };
+    PUBLIC_FUNCTION_WITH_LOCALS(getPoolNFT)
+    {
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (input.index >= locals.meta.numNfts) { output.returnCode = QREWARDS_INVALID_INDEX; return; }
+        locals.rule = state.get().nftRegistry.get(input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL + input.index);
+        output.nftId = locals.rule.nftId;
+        output.weightPoints = locals.rule.weightPoints;
+        output.active = locals.rule.active;
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    // Return every registered NFT in a pool in one call.
+    struct getAllPoolNFTs_input { uint64 poolId; };
+    struct getAllPoolNFTs_output
+    {
+        Array<NFTRule, QREWARDS_MAX_NFT_PER_POOL> nfts;
+        uint32 count;
+        sint32 returnCode;
+    };
+    struct getAllPoolNFTs_locals { PoolMeta meta; uint32 i; uint64 base; };
+    PUBLIC_FUNCTION_WITH_LOCALS(getAllPoolNFTs)
+    {
+        setMemory(output, 0);
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        locals.base = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
+        for (locals.i = 0; locals.i < locals.meta.numNfts; locals.i++)
+        {
+            output.nfts.set(locals.i, state.get().nftRegistry.get(locals.base + locals.i));
+        }
+        output.count = locals.meta.numNfts;
         output.returnCode = QREWARDS_SUCCESS;
     }
 
@@ -1458,6 +1664,8 @@ public:
         REGISTER_USER_FUNCTION(getPoolsByAdmin, 6);
         REGISTER_USER_FUNCTION(isExcluded, 7);
         REGISTER_USER_FUNCTION(previewWeight, 8);
+        REGISTER_USER_FUNCTION(getPoolNFT, 9);
+        REGISTER_USER_FUNCTION(getAllPoolNFTs, 10);
 
         REGISTER_USER_PROCEDURE(createPool, 1);
         REGISTER_USER_PROCEDURE(registerAsset, 2);
@@ -1476,6 +1684,9 @@ public:
         REGISTER_USER_PROCEDURE(setTargetMode, 15);
         REGISTER_USER_PROCEDURE(addRecipients, 16);
         REGISTER_USER_PROCEDURE(clearRecipients, 17);
+        REGISTER_USER_PROCEDURE(registerNFT, 18);
+        REGISTER_USER_PROCEDURE(updateNFT, 19);
+        REGISTER_USER_PROCEDURE(removeNFT, 20);
     }
 
     INITIALIZE()
